@@ -14,6 +14,8 @@ Pick an audio file and Onsetbeat analyses it entirely in the browser:
 
 Long songs can be cut to 1, 1:30 or 2 minutes for a playthrough; the cut starts and ends on a bar line and the music fades out at the end.
 
+How each step works, with illustrations: [docs/analysis.md](docs/analysis.md).
+
 The close-up view shows onset strength, the beat grid and the generated chart, and "Hear the chart" plays the song with a click on every marker.
 
 The analysis runs on a mono 11 kHz copy of the song. Short songs play from a full-quality decode; songs over 8 minutes stream the original file, so a 23-minute track never has to sit decoded in memory.
