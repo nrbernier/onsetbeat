@@ -357,6 +357,7 @@ function analyzeAudio(x, sr, report) {
   const nW = Math.max(1, Math.floor((n - winF) / hopW) + 1), NL = maxL - minL + 1;
   const emis = new Float32Array(nW * NL), wac = new Float32Array(2 * maxL + 3);
   for (let w = 0; w < nW; w++) {
+    if (report && (w & 63) === 0) report(0.82 + 0.05 * w / nW);
     const s0 = w * hopW, s1 = s0 + winF;
     for (let L = minL; L <= 2 * maxL + 2; L++) {
       let s = 0; for (let i = s0; i + L < s1; i++) s += nov[i] * nov[i + L];
@@ -405,6 +406,7 @@ function analyzeAudio(x, sr, report) {
   const cum = new Float32Array(n), back = new Int32Array(n).fill(-1);
   let started = false;
   for (let t = 0; t < n; t++) {
+    if (report && (t & 8191) === 0) report(0.88 + 0.05 * t / n);
     const Pt0 = Pl[t], lo = Math.max(1, Math.round(Pt0 / 2)), hi = Math.round(2 * Pt0);
     let best = -Infinity, bi = -1;
     for (let d = lo; d <= hi; d++) { const p = t - d; if (p < 0) break; const v = cum[p] - 100 * Math.log(d / Pt0) ** 2; if (v > best) { best = v; bi = p; } }
@@ -878,24 +880,46 @@ async function makeDemo() {
 
 /* ---------- Loading & analysis ---------- */
 const workerSrc = analyzeAudio.toString() + '\nself.onmessage=function(e){var r=analyzeAudio(e.data.pcm,e.data.sr,function(p){self.postMessage({type:"progress",p:p});});self.postMessage({type:"done",res:r});};';
-function runAnalysis(pcm, sr, onP) {
-  return new Promise(resolve => {
+// The mono copy is handed to the worker (transferred, not copied) to keep peak memory low;
+// if the worker fails it is rebuilt from the song buffer and analysed on the page instead.
+function runAnalysis(buffer, onP) {
+  return new Promise(async resolve => {
+    const fallback = async () => { const pcm = await toMono(buffer); setTimeout(() => resolve(analyzeAudio(pcm, 22050, onP)), 30); };
     let w;
-    const fallback = () => setTimeout(() => resolve(analyzeAudio(pcm, sr, onP)), 30);
     try { w = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }))); } catch (e) { return fallback(); }
     w.onmessage = e => { if (e.data.type === 'progress') onP(e.data.p); else { w.terminate(); resolve(e.data.res); } };
     w.onerror = () => { w.terminate(); fallback(); };
-    w.postMessage({ pcm, sr });
+    const pcm = await toMono(buffer);
+    w.postMessage({ pcm, sr: 22050 }, [pcm.buffer]);
   });
 }
 async function toMono(buf, sr = 22050) {
+  if (buf.sampleRate === sr) { // already at the analysis rate: average the channels directly, no second render
+    const ch = buf.numberOfChannels, out = new Float32Array(buf.length);
+    for (let c = 0; c < ch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) out[i] += d[i] / ch; }
+    return out;
+  }
   const oc = new Offline(1, Math.max(1, Math.ceil(buf.duration * sr)), sr);
   const s = oc.createBufferSource(); s.buffer = buf; s.connect(oc.destination); s.start();
-  return (await renderOffline(oc)).getChannelData(0);
+  return (await renderOffline(oc)).getChannelData(0).slice();
 }
-function decodeFile(ab) {
-  const oc = new Offline(2, 44100, 44100);
+// Songs over ~8 minutes are decoded at 22.05 kHz: half the memory (a 23-minute song needs
+// ~245 MB instead of ~490 MB), which is what keeps phones from stalling or reloading the page.
+const LONG_SONG = 8 * 60;
+function decodeFile(ab, rate) {
+  const oc = new Offline(2, rate, rate);
   return new Promise((res, rej) => { const p = oc.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
+}
+function probeDuration(file) {
+  return new Promise(res => {
+    const a = new Audio(), u = URL.createObjectURL(file);
+    const done = v => { URL.revokeObjectURL(u); a.removeAttribute('src'); res(v); };
+    a.preload = 'metadata';
+    a.onloadedmetadata = () => done(isFinite(a.duration) ? a.duration : 0);
+    a.onerror = () => done(0);
+    setTimeout(() => done(0), 4000);
+    a.src = u;
+  });
 }
 
 let current = null, currentMap = null, detailStart = 0, cropStart = 0;
@@ -938,8 +962,7 @@ async function loadBuffer(name, buffer, isDemo) {
   stopPreview();
   $('#play').disabled = $('#listen').disabled = true;
   if (!isDemo) setStatus('Analysing rhythm…', 0.05);
-  const pcm = await toMono(buffer);
-  const res = await runAnalysis(pcm, 22050, p => { if (!isDemo) setStatus('Analysing rhythm…', 0.05 + 0.9 * p); });
+  const res = await runAnalysis(buffer, p => { if (!isDemo) setStatus('Analysing rhythm…', 0.05 + 0.9 * p); });
   current = prepareAnalysis(Object.assign(res, { name, buffer, isDemo }));
   detailStart = 0; cropStart = 0;
   if (!isDemo) setStatus('');
@@ -971,11 +994,21 @@ $('#file').addEventListener('change', e => { const f = e.target.files[0]; if (f)
 async function handleFile(f) {
   try {
     setStatus('Reading ' + f.name + '…', 0.02);
-    const buf = await decodeFile(await f.arrayBuffer());
+    stopPreview(true);
+    // free the previous song before decoding the next one
+    if (current) { current.buffer = null; current = null; currentMap = null; $('#play').disabled = $('#listen').disabled = true; }
+    let est = await probeDuration(f);
+    if (!est) est = f.size / 32000; // ~256 kbps guess when the browser can't read the length up front
+    const long = est > LONG_SONG, t0 = performance.now();
+    const label = long ? `Decoding a ${Math.round(est / 60)}-minute song (lighter quality to save memory)` : 'Decoding ' + f.name;
+    const tick = () => setStatus(`${label}… ${Math.round((performance.now() - t0) / 1000)} s`, 0.03);
+    tick(); const timer = setInterval(tick, 1000);
+    let buf;
+    try { buf = await decodeFile(await f.arrayBuffer(), long ? 22050 : 44100); } finally { clearInterval(timer); }
     if (!buf || buf.duration < 5) throw new Error('short');
     await loadBuffer(f.name.replace(/\.[^.]+$/, ''), buf, false);
   } catch (e) {
-    setStatus(e && e.message === 'short' ? 'That clip is under 5 seconds. Pick a longer song.' : 'This browser could not decode that file. Try an MP3, M4A or WAV.', 0, true);
+    setStatus(e && e.message === 'short' ? 'That clip is under 5 seconds. Pick a longer song.' : 'This browser could not decode that file, or ran out of memory. Try an MP3, an AAC M4A, or a shorter song.', 0, true);
     if (current) $('#play').disabled = $('#listen').disabled = false;
   }
 }
