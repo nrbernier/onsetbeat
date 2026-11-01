@@ -262,7 +262,8 @@ const TAU = Math.PI * 2;
 
 /* ---------- Audio analysis (runs in a Worker; must stay self-contained) ---------- */
 function analyzeAudio(x, sr, report) {
-  const N = 1024, H = 256, half = N >> 1;
+  // same ~11.6 ms hop and ~46 ms window at 22.05 kHz (N=1024) and at 11.025 kHz (N=512)
+  const N = sr >= 16000 ? 1024 : 512, H = N >> 2, half = N >> 1;
   const nFrames = Math.max(16, Math.floor((x.length - N) / H) + 1);
   const hopT = H / sr, off = (N / 2) / sr;
   const win = new Float32Array(N);
@@ -880,35 +881,87 @@ async function makeDemo() {
 
 /* ---------- Loading & analysis ---------- */
 const workerSrc = analyzeAudio.toString() + '\nself.onmessage=function(e){var r=analyzeAudio(e.data.pcm,e.data.sr,function(p){self.postMessage({type:"progress",p:p});});self.postMessage({type:"done",res:r});};';
-// The mono copy is handed to the worker (transferred, not copied) to keep peak memory low;
-// if the worker fails it is rebuilt from the song buffer and analysed on the page instead.
+// Analysis runs on a mono 11.025 kHz copy (as accurate as 22 kHz for beats and onsets, a
+// quarter of the memory of the playback audio). It is handed to the worker (transferred, not
+// copied); if the worker fails it is rebuilt and analysed on the page instead.
+const ANALYSIS_RATE = 11025;
+function offlineCtx(ch, len, rate) {
+  try { return { oc: new Offline(ch, len, rate), rate }; }
+  catch (e) { return { oc: new Offline(ch, Math.ceil(len * 22050 / rate), 22050), rate: 22050 }; } // older Safari: no 11 kHz contexts
+}
 function runAnalysis(buffer, onP) {
   return new Promise(async resolve => {
-    const fallback = async () => { const pcm = await toMono(buffer); setTimeout(() => resolve(analyzeAudio(pcm, 22050, onP)), 30); };
+    const fallback = async () => { const m = await toMono(buffer); setTimeout(() => resolve(analyzeAudio(m.pcm, m.sr, onP)), 30); };
     let w;
     try { w = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }))); } catch (e) { return fallback(); }
     w.onmessage = e => { if (e.data.type === 'progress') onP(e.data.p); else { w.terminate(); resolve(e.data.res); } };
     w.onerror = () => { w.terminate(); fallback(); };
-    const pcm = await toMono(buffer);
-    w.postMessage({ pcm, sr: 22050 }, [pcm.buffer]);
+    const m = await toMono(buffer);
+    w.postMessage({ pcm: m.pcm, sr: m.sr }, [m.pcm.buffer]);
   });
 }
-async function toMono(buf, sr = 22050) {
-  if (buf.sampleRate === sr) { // already at the analysis rate: average the channels directly, no second render
+async function toMono(buf) {
+  if (buf.sampleRate <= 22050) { // decoded straight at a low rate: just average the channels
     const ch = buf.numberOfChannels, out = new Float32Array(buf.length);
     for (let c = 0; c < ch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) out[i] += d[i] / ch; }
-    return out;
+    return { pcm: out, sr: buf.sampleRate };
   }
-  const oc = new Offline(1, Math.max(1, Math.ceil(buf.duration * sr)), sr);
+  const { oc, rate } = offlineCtx(1, Math.max(1, Math.ceil(buf.duration * ANALYSIS_RATE)), ANALYSIS_RATE);
   const s = oc.createBufferSource(); s.buffer = buf; s.connect(oc.destination); s.start();
-  return (await renderOffline(oc)).getChannelData(0).slice();
+  return { pcm: (await renderOffline(oc)).getChannelData(0).slice(), sr: rate };
 }
-// Songs over ~8 minutes are decoded at 22.05 kHz: half the memory (a 23-minute song needs
-// ~245 MB instead of ~490 MB), which is what keeps phones from stalling or reloading the page.
+// Songs over 8 minutes are never decoded at full quality: the analysis gets a small 11 kHz
+// decode (~120 MB for 23 minutes instead of ~490 MB), and the game streams the original file.
 const LONG_SONG = 8 * 60;
 function decodeFile(ab, rate) {
-  const oc = new Offline(2, rate, rate);
+  const { oc } = offlineCtx(2, rate, rate);
   return new Promise((res, rej) => { const p = oc.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
+}
+
+/* streamed playback of the original file (long songs), routed through Web Audio for visuals */
+function mediaGraph(an) {
+  if (an.graph) return an.graph;
+  const ctx = ensureCtx();
+  const src = ctx.createMediaElementSource(an.media), delay = ctx.createDelay(10), gain = ctx.createGain(), analyser = ctx.createAnalyser();
+  analyser.fftSize = 256; analyser.smoothingTimeConstant = 0.7;
+  src.connect(delay); delay.connect(gain); gain.connect(analyser); analyser.connect(ctx.destination);
+  return (an.graph = { src, delay, gain, analyser });
+}
+// The element's clock moves in coarse steps; this keeps a smooth estimate tied to performance.now()
+const clock = { off: null, raw: -1 };
+function clockReset() { clock.off = null; clock.raw = -1; }
+function clockTick(el, perf) {
+  const raw = el.currentTime;
+  if (el.paused || el.seeking || el.readyState < 3) { clock.off = null; clock.raw = raw; return; } // not moving: hold still
+  if (raw !== clock.raw) {
+    clock.raw = raw; const d = raw - perf / 1000;
+    if (clock.off === null || Math.abs(d - clock.off) > 0.08) clock.off = d; else clock.off += 0.12 * (d - clock.off);
+  }
+}
+const clockAt = perf => clock.off === null ? clock.raw : clock.off + perf / 1000;
+// start the element so its sound comes out `delaySec` later; the gain opens once playback really begins
+function playMedia(an, from, delaySec) {
+  const ctx = ensureCtx(), g = mediaGraph(an), el = an.media, now = ctx.currentTime;
+  el.pause();
+  g.gain.gain.cancelScheduledValues(now); g.gain.gain.setValueAtTime(0, now);
+  g.delay.delayTime.cancelScheduledValues(now); g.delay.delayTime.setValueAtTime(delaySec, now);
+  el.onplaying = () => { const t = ctx.currentTime + delaySec; g.gain.gain.cancelScheduledValues(ctx.currentTime); g.gain.gain.setValueAtTime(0, t); g.gain.gain.linearRampToValueAtTime(1, t + 0.03); };
+  try { el.currentTime = from; } catch (e) {}
+  clockReset();
+  const p = el.play(); if (p && p.catch) p.catch(() => {});
+  return g;
+}
+function muteMedia(an) {
+  if (!an || !an.media) return;
+  an.media.pause(); an.media.onplaying = null;
+  if (an.graph && actx) { const g = an.graph.gain.gain; g.cancelScheduledValues(actx.currentTime); g.setValueAtTime(0, actx.currentTime); }
+}
+function releaseSong(an) {
+  if (!an) return;
+  muteMedia(an);
+  if (an.graph) { try { an.graph.src.disconnect(); an.graph.analyser.disconnect(); } catch (e) {} }
+  if (an.media) { an.media.removeAttribute('src'); try { an.media.load(); } catch (e) {} URL.revokeObjectURL(an.mediaUrl); }
+  an.buffer = null; an.media = null;
 }
 function probeDuration(file) {
   return new Promise(res => {
@@ -958,12 +1011,13 @@ function setStatus(text, p, err) {
   $('#statusBar').style.width = Math.round((p || 0) * 100) + '%';
   $('#statusBar').parentElement.hidden = !!err;
 }
-async function loadBuffer(name, buffer, isDemo) {
+async function loadBuffer(name, buffer, isDemo, media) {
   stopPreview();
   $('#play').disabled = $('#listen').disabled = true;
   if (!isDemo) setStatus('Analysing rhythm…', 0.05);
   const res = await runAnalysis(buffer, p => { if (!isDemo) setStatus('Analysing rhythm…', 0.05 + 0.9 * p); });
-  current = prepareAnalysis(Object.assign(res, { name, buffer, isDemo }));
+  current = prepareAnalysis(Object.assign(res, { name, buffer: media ? null : buffer, isDemo }, media || {}));
+  buffer = null;
   detailStart = 0; cropStart = 0;
   if (!isDemo) setStatus('');
   $('#trackName').textContent = name;
@@ -996,17 +1050,22 @@ async function handleFile(f) {
     setStatus('Reading ' + f.name + '…', 0.02);
     stopPreview(true);
     // free the previous song before decoding the next one
-    if (current) { current.buffer = null; current = null; currentMap = null; $('#play').disabled = $('#listen').disabled = true; }
+    if (current) { releaseSong(current); current = null; currentMap = null; $('#play').disabled = $('#listen').disabled = true; }
     let est = await probeDuration(f);
     if (!est) est = f.size / 32000; // ~256 kbps guess when the browser can't read the length up front
     const long = est > LONG_SONG, t0 = performance.now();
-    const label = long ? `Decoding a ${Math.round(est / 60)}-minute song (lighter quality to save memory)` : 'Decoding ' + f.name;
+    const label = long ? `Preparing a ${Math.round(est / 60)}-minute song for analysis` : 'Decoding ' + f.name;
     const tick = () => setStatus(`${label}… ${Math.round((performance.now() - t0) / 1000)} s`, 0.03);
     tick(); const timer = setInterval(tick, 1000);
     let buf;
-    try { buf = await decodeFile(await f.arrayBuffer(), long ? 22050 : 44100); } finally { clearInterval(timer); }
+    try { buf = await decodeFile(await f.arrayBuffer(), long ? ANALYSIS_RATE : 44100); } finally { clearInterval(timer); }
     if (!buf || buf.duration < 5) throw new Error('short');
-    await loadBuffer(f.name.replace(/\.[^.]+$/, ''), buf, false);
+    let media = null;
+    if (long) { // play the original file, streamed, instead of holding it decoded in memory
+      const url = URL.createObjectURL(f), el = new Audio(); el.preload = 'auto'; el.src = url;
+      media = { media: el, mediaUrl: url };
+    }
+    await loadBuffer(f.name.replace(/\.[^.]+$/, ''), buf, false, media);
   } catch (e) {
     setStatus(e && e.message === 'short' ? 'That clip is under 5 seconds. Pick a longer song.' : 'This browser could not decode that file, or ran out of memory. Try an MP3, an AAC M4A, or a shorter song.', 0, true);
     if (current) $('#play').disabled = $('#listen').disabled = false;
@@ -1150,20 +1209,29 @@ let preview = null;
 function startPreview() {
   if (!current) return;
   const ctx = ensureCtx(); stopPreview(true);
-  const from = detailStart, src = ctx.createBufferSource(); src.buffer = current.buffer; src.connect(ctx.destination);
-  const startAt = ctx.currentTime + 0.15; src.start(startAt, from);
+  const from = detailStart, an = current;
   let idx = currentMap.objs.findIndex(o => o.t >= from); if (idx < 0) idx = currentMap.objs.length;
-  preview = { src, startAt, from, idx };
-  src.onended = () => { if (preview && preview.src === src) stopPreview(); };
+  if (an.media) {
+    playMedia(an, from, 0);
+    an.media.onended = () => { if (preview && preview.an === an) stopPreview(); };
+    // song position -> context time, re-estimated from the element's clock on every tick
+    preview = { an, from, idx, songAt: () => { clockTick(an.media, performance.now()); return clockAt(performance.now()); }, stop: () => muteMedia(an) };
+  } else {
+    const src = ctx.createBufferSource(); src.buffer = an.buffer; src.connect(ctx.destination);
+    const startAt = ctx.currentTime + 0.15; src.start(startAt, from);
+    preview = { an, from, idx, songAt: () => ctx.currentTime - startAt + from, stop: () => { try { src.onended = null; src.stop(); } catch (e) {} } };
+    src.onended = () => { if (preview && preview.an === an) stopPreview(); };
+  }
   preview.timer = setInterval(() => {
     if (!preview) return;
-    const now = ctx.currentTime, objs = currentMap.objs;
+    const now = ctx.currentTime, objs = currentMap.objs, songT = preview.songAt();
+    const at0 = t => now + (t - songT);
     while (preview.idx < objs.length) {
-      const o = objs[preview.idx], at = preview.startAt + (o.t - preview.from);
+      const o = objs[preview.idx], at = at0(o.t);
       if (at > now + 0.3) break;
       if (at >= now - 0.01) {
         if (o.type === 'tap') sBlip(at, 1250, 0.06, 0.4, 'triangle');
-        else if (o.type === 'slider') { sBlip(at, 880, 0.08, 0.4, 'triangle'); sBlip(preview.startAt + (o.end - preview.from), 660, 0.05, 0.25, 'triangle'); }
+        else if (o.type === 'slider') { sBlip(at, 880, 0.08, 0.4, 'triangle'); sBlip(at0(o.end), 660, 0.05, 0.25, 'triangle'); }
         else { sBlip(at, 220, 0.25, 0.5); }
       }
       preview.idx++;
@@ -1172,7 +1240,7 @@ function startPreview() {
   $('#listen').textContent = 'Stop';
   const tick = () => {
     if (!preview) return;
-    const ph = ctx.currentTime - (ctx.outputLatency || 0) - preview.startAt + preview.from;
+    const ph = preview.songAt() - (ctx.outputLatency || 0);
     if (ph > detailStart + DETAIL_WIN * 0.75) detailStart = Math.min(Math.max(0, current.duration - DETAIL_WIN), ph - DETAIL_WIN * 0.25);
     drawAnalysis(ph);
     preview.raf = requestAnimationFrame(tick);
@@ -1183,7 +1251,7 @@ function stopPreview(silent) {
   if (!preview) return;
   const p = preview; preview = null;
   clearInterval(p.timer); cancelAnimationFrame(p.raf);
-  try { p.src.onended = null; p.src.stop(); } catch (e) {}
+  p.stop();
   $('#listen').textContent = 'Hear the chart';
   if (!silent) drawAnalysis();
 }
@@ -1210,7 +1278,9 @@ function placeField() {
 const toPx = p => ({ x: PF.ox + p.x * PF.S, y: PF.oy + p.y * PF.S });
 
 function songNow(perf) {
-  const c = actx; let ct = c.currentTime - (c.outputLatency || c.baseLatency || 0);
+  const c = actx;
+  if (G.media) return clockAt(perf ?? performance.now()) - G.mdelay - (c.outputLatency || c.baseLatency || 0) - settings.offset / 1000;
+  let ct = c.currentTime - (c.outputLatency || c.baseLatency || 0);
   if (c.getOutputTimestamp) {
     const ts = c.getOutputTimestamp();
     if (ts && ts.performanceTime > 0 && ts.contextTime > 0) {
@@ -1226,8 +1296,7 @@ async function startGame() {
   if (!current) return;
   stopPreview(true);
   const ctx = ensureCtx();
-  try { await ctx.resume(); } catch (e) {}
-  try { await document.fonts.load(`40px ${DISPLAY}`); } catch (e) {}
+  document.fonts.load(`40px ${DISPLAY}`).catch(() => {});
   $('#game').hidden = false; $('#results').hidden = true; $('#pauseMenu').hidden = true;
   document.body.style.overflow = 'hidden';
   G.map = null; resizeGame();
@@ -1239,13 +1308,26 @@ async function startGame() {
     counts: { 300: 0, 100: 0, 50: 0, 0: 0 }, health: 1, pops: [], errs: [], first: 0, spin: null, lastPerf: performance.now(), beatI: 0, failed: false });
   for (const o of G.objs) { o.done = false; o.res = null; o.headDone = false; o.headHit = false; o.tickI = 0; o.tickHit = 0; o.following = false; o.acc = 0; o.vis = 0; o.doneAt = 0; o.shake = 0; }
   G.lastEnd = G.objs.length ? Math.max(...G.objs.map(o => o.end || o.t)) : ce;
+  const firstT = G.objs.length ? G.objs[0].t : cs;
+  const lead = Math.max(1.0, D.ar + 0.8 - (firstT - cs));
+  G.fading = false;
+  if (current.media) {
+    // streamed original: start now from the cut, heard `lead` seconds later through a delay line
+    const g = playMedia(current, cs, lead);
+    current.media.onended = () => { if (G.running && !G.ended) finish(false); };
+    G.media = current.media; G.mdelay = lead; G.gain = g.gain; G.analyser = g.analyser; G.src = null;
+    G.freq = new Uint8Array(G.analyser.frequencyBinCount);
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { wakeLock = null; }
+    if (!G.loop) G.loop = requestAnimationFrame(frame);
+    return;
+  }
+  G.media = null;
   G.analyser = ctx.createAnalyser(); G.analyser.fftSize = 256; G.analyser.smoothingTimeConstant = 0.7;
   G.freq = new Uint8Array(G.analyser.frequencyBinCount);
   G.src = ctx.createBufferSource(); G.src.buffer = current.buffer;
   G.gain = ctx.createGain();
   G.src.connect(G.gain); G.gain.connect(G.analyser); G.analyser.connect(ctx.destination);
-  const firstT = G.objs.length ? G.objs[0].t : cs;
-  const lead = Math.max(1.0, D.ar + 0.8 - (firstT - cs)), at = ctx.currentTime + lead;
+  const at = ctx.currentTime + lead;
   G.startAt = at - cs; // song time = context time − startAt, so markers keep their song timestamps
   const gg = G.gain.gain;
   gg.setValueAtTime(cs > 0.01 ? 0 : 1, at); if (cs > 0.01) gg.linearRampToValueAtTime(1, at + 0.03);
@@ -1257,7 +1339,10 @@ async function startGame() {
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { wakeLock = null; }
   if (!G.loop) G.loop = requestAnimationFrame(frame);
 }
-function stopAudio() { if (G.src) { try { G.src.stop(); } catch (e) {} G.src.disconnect(); G.src = null; } }
+function stopAudio() {
+  if (G.src) { try { G.src.stop(); } catch (e) {} G.src.disconnect(); G.src = null; }
+  if (G.media && current) { current.media.onended = null; muteMedia(current); }
+}
 function quitGame() {
   G.running = false; stopAudio(); if (actx && actx.state === 'suspended') actx.resume().catch(() => {});
   $('#game').hidden = true; document.body.style.overflow = '';
@@ -1266,9 +1351,12 @@ function quitGame() {
 }
 function pauseGame() {
   if (!G.running || G.paused || G.ended) return;
-  G.paused = true; actx.suspend().catch(() => {}); $('#pauseMenu').hidden = false;
+  G.paused = true; if (G.media) G.media.pause(); actx.suspend().catch(() => {}); $('#pauseMenu').hidden = false;
 }
-function resumeGame() { G.paused = false; $('#pauseMenu').hidden = true; actx.resume().catch(() => {}); G.lastPerf = performance.now(); }
+function resumeGame() {
+  G.paused = false; $('#pauseMenu').hidden = true; actx.resume().catch(() => {}); G.lastPerf = performance.now();
+  if (G.media) { clockReset(); const p = G.media.play(); if (p && p.catch) p.catch(() => {}); }
+}
 $('#play').addEventListener('click', startGame);
 $('#pauseBtn').addEventListener('click', pauseGame);
 $('#resumeBtn').addEventListener('click', resumeGame);
@@ -1403,7 +1491,14 @@ function frame(perf) {
   G.loop = requestAnimationFrame(frame);
   if ($('#game').hidden || !G.map) return;
   const dt = Math.min(0.05, (perf - G.lastPerf) / 1000); G.lastPerf = perf;
+  if (G.media) clockTick(G.media, perf);
   const now = actx ? songNow(perf) : 0;
+  if (G.media && G.running && !G.paused && !G.ended && G.cropE < current.duration - 0.01) {
+    if (!G.fading && now >= G.cropE - 1.5) {
+      G.fading = true; const g = G.gain, t = actx.currentTime;
+      g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(0.0001, t + Math.max(0.05, G.cropE - now));
+    }
+  }
   if (G.running && !G.paused && !G.ended) update(now, dt);
   draw(now, perf);
 }

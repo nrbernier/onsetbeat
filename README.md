@@ -16,4 +16,6 @@ Long songs can be cut to 1, 1:30 or 2 minutes for a playthrough; the cut starts 
 
 The close-up view shows onset strength, the beat grid and the generated chart, and "Hear the chart" plays the song with a click on every marker.
 
+The analysis runs on a mono 11 kHz copy of the song. Short songs play from a full-quality decode; songs over 8 minutes stream the original file, so a 23-minute track never has to sit decoded in memory.
+
 No build step and no dependencies: `index.html` is the whole app, so it runs as is on GitHub Pages. Audio files never leave the device.
