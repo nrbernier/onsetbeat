@@ -12,6 +12,8 @@ Pick an audio file and Onsetbeat analyses it entirely in the browser:
 6. **Chart**: onsets are snapped to the grid and the strongest are kept per difficulty (Easy: beats only … Insane: sixteenths).
 7. **Markers**: sustained sound after a note becomes a **phrase** (slider, sometimes with reverses), a long loud stretch without hits becomes a **spin**, everything else is a **tap**. Markers are placed so nothing overlaps anything still on screen.
 
+Long songs can be cut to 1, 1:30 or 2 minutes for a playthrough; the cut starts and ends on a bar line and the music fades out at the end.
+
 The close-up view shows onset strength, the beat grid and the generated chart, and "Hear the chart" plays the song with a click on every marker.
 
 No build step and no dependencies: `index.html` is the whole app, so it runs as is on GitHub Pages. Audio files never leave the device.

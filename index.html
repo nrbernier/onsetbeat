@@ -72,6 +72,11 @@ input[type=range]{width:100%;accent-color:var(--gold)}
 .diffs button{font:inherit;font-weight:700;font-size:14px;color:var(--fg);background:transparent;border:0;border-radius:10px;padding:10px 2px;cursor:pointer}
 .diffs button[aria-checked=true]{background:var(--gold);color:#1a1530}
 .diffs button:focus-visible,.btn:focus-visible,.drop:focus-within{outline:3px solid var(--sky);outline-offset:2px}
+.crop{display:flex;flex-direction:column;gap:8px}
+.crop-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.crop-head output{font-family:var(--mono);font-size:14px;font-variant-numeric:tabular-nums}
+.crop-lab{display:block;font-size:13.5px;color:var(--muted);margin-bottom:2px}
+.diffs button:disabled{opacity:.35;cursor:default}
 .actions{display:grid;grid-template-columns:2fr 1fr;gap:10px}
 .btn{font-family:var(--display);font-size:20px;border-radius:14px;padding:14px 16px;border:0;cursor:pointer;color:#1a1530;background:var(--gold)}
 .btn.ghost{background:transparent;color:var(--fg);border:1.5px solid var(--line);font-family:var(--body);font-weight:700;font-size:15px}
@@ -161,6 +166,19 @@ input[type=range]{width:100%;accent-color:var(--gold)}
         <span><i class="bar" style="background:var(--sky)"></i>Phrase</span>
         <span><i class="bar sq" style="background:var(--red)"></i>Spin</span>
         <span><i class="sq" style="background:var(--mint);width:3px"></i>Triplet grid</span>
+      </div>
+    </div>
+    <div class="crop">
+      <div class="crop-head"><span class="label">Play</span><output id="cropOut">–</output></div>
+      <div class="diffs" role="radiogroup" aria-label="How much of the song to play" id="lens">
+        <button role="radio" data-len="0" aria-checked="true">Whole</button>
+        <button role="radio" data-len="60" aria-checked="false">1 min</button>
+        <button role="radio" data-len="90" aria-checked="false">1:30</button>
+        <button role="radio" data-len="120" aria-checked="false">2 min</button>
+      </div>
+      <div id="cropStartRow" hidden>
+        <label for="cropStart" class="crop-lab">Start point (snaps to the nearest bar)</label>
+        <input type="range" id="cropStart" min="0" max="0" step="1" value="0">
       </div>
     </div>
     <div class="diffs" role="radiogroup" aria-label="Difficulty" id="diffs">
@@ -733,7 +751,12 @@ function layoutMap(objs, an, D, aspect, rng) {
       shown.push({ pts: [{ x: o.x, y: o.y }], until: o.t + 0.3 });
     }
   }
-  // combos: a new number sequence each bar (two on Easy), after spins, or after 8 notes
+  assignCombos(objs, an, D);
+  return { fw, fh };
+}
+
+// combos: a new number sequence each bar (two on Easy), after spins, or after 8 notes
+function assignCombos(objs, an, D) {
   let num = 0, bar0 = -99, col = -1;
   const barsPer = D.key === 'easy' ? 2 : 1;
   for (const o of objs) {
@@ -742,7 +765,14 @@ function layoutMap(objs, an, D, aspect, rng) {
     if (num === 0 || num >= 8 || (bar - bar0 >= barsPer && num >= 3)) { col = (col + 1) % 4; num = 0; bar0 = bar; }
     num++; o.num = num; o.col = col;
   }
-  return { fw, fh };
+}
+
+// keep only markers fully inside [s, e] and renumber combos from the start of the cut
+function cropMap(map, an, s, e) {
+  if (s <= 0.01 && e >= an.duration - 0.01) return map;
+  const objs = map.objs.filter(o => o.t >= s + 0.05 && (o.end || o.t) <= e - 0.3);
+  assignCombos(objs, an, map.D);
+  return Object.assign({}, map, { objs });
 }
 
 function sliderPosFrac(o, frac) {
@@ -771,7 +801,7 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('onsetbeat:' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem('onsetbeat:' + k, JSON.stringify(v)); } catch (e) {} }
 };
-const settings = { diff: store.get('diff', 'normal'), sounds: store.get('sounds', true), nofail: store.get('nofail', false), offset: store.get('offset', 0) };
+const settings = { cropLen: store.get('cropLen', 0), diff: store.get('diff', 'normal'), sounds: store.get('sounds', true), nofail: store.get('nofail', false), offset: store.get('offset', 0) };
 if (!DIFFS[settings.diff]) settings.diff = 'normal';
 
 let actx = null, noiseBuf = null;
@@ -868,7 +898,34 @@ function decodeFile(ab) {
   return new Promise((res, rej) => { const p = oc.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
 }
 
-let current = null, currentMap = null, detailStart = 0;
+let current = null, currentMap = null, detailStart = 0, cropStart = 0;
+const CROP_LENS = [0, 60, 90, 120];
+const fmtTime = t => { t = Math.max(0, Math.round(t)); return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'); };
+// the part of the song to play, cut on bar starts so it begins and ends with the music
+function cropRange() {
+  if (!current) return [0, 0];
+  const dur = current.duration, len = settings.cropLen;
+  if (!len || len >= dur - 5) return [0, dur];
+  const bars = current.beats.filter((b, i) => current.barPos[i] === 0);
+  const snap = t => { let best = t, bd = Infinity; for (const b of bars) { const d = Math.abs(b - t); if (d < bd) { bd = d; best = b; } } return bd < 4 ? best : t; };
+  const s = snap(clamp(cropStart, 0, dur - len));
+  const e = Math.min(dur, snap(s + len));
+  return e - s < 10 ? [s, Math.min(dur, s + len)] : [s, e];
+}
+function syncCrop() {
+  if (!current) return;
+  const dur = current.duration;
+  const full = !settings.cropLen || settings.cropLen >= dur - 5;
+  document.querySelectorAll('#lens button').forEach(b => {
+    const v = +b.dataset.len;
+    b.disabled = v > 0 && v >= dur - 5;
+    b.setAttribute('aria-checked', String(full ? v === 0 : v === settings.cropLen));
+  });
+  $('#cropStartRow').hidden = full;
+  const sl = $('#cropStart'); sl.max = String(Math.max(0, Math.floor(dur - (settings.cropLen || dur)))); sl.value = String(Math.round(cropStart));
+  const [a, b] = cropRange();
+  $('#cropOut').textContent = full ? 'Whole song · ' + fmtTime(dur) : fmtTime(a) + ' – ' + fmtTime(b) + ' · ' + fmtTime(b - a);
+}
 const DETAIL_WIN = 8;
 function setStatus(text, p, err) {
   $('#status').hidden = !text;
@@ -884,7 +941,7 @@ async function loadBuffer(name, buffer, isDemo) {
   const pcm = await toMono(buffer);
   const res = await runAnalysis(pcm, 22050, p => { if (!isDemo) setStatus('Analysing rhythm…', 0.05 + 0.9 * p); });
   current = prepareAnalysis(Object.assign(res, { name, buffer, isDemo }));
-  detailStart = 0;
+  detailStart = 0; cropStart = 0;
   if (!isDemo) setStatus('');
   $('#trackName').textContent = name;
   $('#trackTag').textContent = isDemo ? 'Demo' : 'Your song';
@@ -900,11 +957,13 @@ async function loadBuffer(name, buffer, isDemo) {
 }
 function refreshMap() {
   if (!current) return;
-  currentMap = generateMap(current, settings.diff, 0.6);
+  const [cs, ce] = cropRange();
+  currentMap = cropMap(generateMap(current, settings.diff, 0.6), current, cs, ce);
+  syncCrop();
   const o = currentMap.objs;
   const nT = o.filter(x => x.type === 'tap').length, nS = o.filter(x => x.type === 'slider').length, nP = o.filter(x => x.type === 'spinner').length;
   $('#cTap').textContent = nT; $('#cSl').textContent = nS; $('#cSp').textContent = nP;
-  $('#cRate').textContent = Math.round(o.length / (current.duration / 60));
+  $('#cRate').textContent = Math.round(o.length / (Math.max(1, ce - cs) / 60));
   drawAnalysis();
 }
 
@@ -951,6 +1010,11 @@ function drawOverview() {
     if (o.type === 'spinner') { c.fillStyle = COLORS[0]; c.fillRect(X(o.t), yL - 5, Math.max(2, X(o.end) - X(o.t)), 10); }
     else if (o.type === 'slider') { c.fillStyle = COLORS[2]; c.fillRect(X(o.t), yL - 3, Math.max(2, X(o.end) - X(o.t)), 6); }
     else { c.fillStyle = COLORS[1]; c.fillRect(X(o.t), yL - 4, 1.2, 8); }
+  }
+  const [cs, ce] = cropRange();
+  if (cs > 0.01 || ce < an.duration - 0.01) {
+    c.fillStyle = 'rgba(18,15,36,0.72)'; c.fillRect(0, 0, X(cs), h); c.fillRect(X(ce), 0, w - X(ce), h);
+    c.fillStyle = COLORS[1]; c.fillRect(X(cs), 0, 2, h); c.fillRect(X(ce) - 2, 0, 2, h);
   }
   c.strokeStyle = '#fff'; c.lineWidth = 1.5; c.globalAlpha = 0.8;
   c.strokeRect(X(detailStart) + 0.75, 0.75, Math.max(4, X(detailStart + DETAIL_WIN) - X(detailStart)) - 1.5, h - 1.5);
@@ -1023,6 +1087,18 @@ $('#diffs').addEventListener('click', e => {
   const b = e.target.closest('button[data-d]'); if (!b) return;
   settings.diff = b.dataset.d; store.set('diff', settings.diff); syncDiffs();
   const wasPreview = !!preview; refreshMap(); if (wasPreview) startPreview();
+});
+$('#lens').addEventListener('click', e => {
+  const b = e.target.closest('button[data-len]'); if (!b || b.disabled || !current) return;
+  settings.cropLen = +b.dataset.len; store.set('cropLen', settings.cropLen);
+  refreshMap();
+  if (settings.cropLen) { detailStart = clamp(cropRange()[0], 0, Math.max(0, current.duration - DETAIL_WIN)); drawAnalysis(); }
+});
+$('#cropStart').addEventListener('input', e => {
+  if (!current) return;
+  cropStart = +e.target.value; stopPreview(true);
+  refreshMap();
+  detailStart = clamp(cropRange()[0], 0, Math.max(0, current.duration - DETAIL_WIN)); drawAnalysis();
 });
 function syncDiffs() { document.querySelectorAll('#diffs button').forEach(b => b.setAttribute('aria-checked', String(b.dataset.d === settings.diff))); }
 syncDiffs();
@@ -1122,19 +1198,29 @@ async function startGame() {
   $('#game').hidden = false; $('#results').hidden = true; $('#pauseMenu').hidden = true;
   document.body.style.overflow = 'hidden';
   G.map = null; resizeGame();
-  G.map = generateMap(current, settings.diff, PF.w / PF.h); placeField();
+  const [cs, ce] = cropRange();
+  G.cropS = cs; G.cropE = ce;
+  G.map = cropMap(generateMap(current, settings.diff, PF.w / PF.h), current, cs, ce); placeField();
   const D = G.map.D;
   Object.assign(G, { running: true, paused: false, ended: false, objs: G.map.objs, D, score: 0, combo: 0, maxCombo: 0,
     counts: { 300: 0, 100: 0, 50: 0, 0: 0 }, health: 1, pops: [], errs: [], first: 0, spin: null, lastPerf: performance.now(), beatI: 0, failed: false });
   for (const o of G.objs) { o.done = false; o.res = null; o.headDone = false; o.headHit = false; o.tickI = 0; o.tickHit = 0; o.following = false; o.acc = 0; o.vis = 0; o.doneAt = 0; o.shake = 0; }
-  G.lastEnd = G.objs.length ? Math.max(...G.objs.map(o => o.end || o.t)) : current.duration;
+  G.lastEnd = G.objs.length ? Math.max(...G.objs.map(o => o.end || o.t)) : ce;
   G.analyser = ctx.createAnalyser(); G.analyser.fftSize = 256; G.analyser.smoothingTimeConstant = 0.7;
   G.freq = new Uint8Array(G.analyser.frequencyBinCount);
   G.src = ctx.createBufferSource(); G.src.buffer = current.buffer;
-  G.src.connect(G.analyser); G.analyser.connect(ctx.destination);
-  const firstT = G.objs.length ? G.objs[0].t : 0;
-  G.startAt = ctx.currentTime + Math.max(1.0, D.ar + 0.8 - firstT);
-  G.src.start(G.startAt);
+  G.gain = ctx.createGain();
+  G.src.connect(G.gain); G.gain.connect(G.analyser); G.analyser.connect(ctx.destination);
+  const firstT = G.objs.length ? G.objs[0].t : cs;
+  const lead = Math.max(1.0, D.ar + 0.8 - (firstT - cs)), at = ctx.currentTime + lead;
+  G.startAt = at - cs; // song time = context time − startAt, so markers keep their song timestamps
+  const gg = G.gain.gain;
+  gg.setValueAtTime(cs > 0.01 ? 0 : 1, at); if (cs > 0.01) gg.linearRampToValueAtTime(1, at + 0.03);
+  if (ce < current.duration - 0.01) {
+    const fs = G.startAt + Math.max(cs + 0.5, ce - 1.5);
+    gg.setValueAtTime(1, fs); gg.linearRampToValueAtTime(0.0001, G.startAt + ce);
+    G.src.start(at, cs, ce - cs + 0.05);
+  } else G.src.start(at, cs);
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { wakeLock = null; }
   if (!G.loop) G.loop = requestAnimationFrame(frame);
 }
@@ -1247,7 +1333,7 @@ function update(now, dtSec) {
   const next = objs[G.first];
   if (next && !G.spin && now > objs[0].t - 0.5 && next.t - now < 2.5) G.health -= D.drain * dtSec;
   if (G.health <= 0) { G.health = 0; if (!settings.nofail) return finish(true); }
-  if ((G.first >= objs.length && now > G.lastEnd + 1.2) || now > current.duration + 0.5) finish(false);
+  if ((G.first >= objs.length && now > Math.min(G.lastEnd + 1.2, G.cropE + 0.3)) || now > G.cropE + 0.5) finish(false);
 }
 
 function finish(failed) {
@@ -1430,7 +1516,7 @@ function drawSpinner(c, o, now, perf) {
 function drawHud(c, now, perf) {
   const top = safe.t + 12, left = safe.l + 66, right = VW - safe.r - 14;
   // progress line
-  const prog = clamp(now / current.duration, 0, 1);
+  const prog = clamp((now - G.cropS) / Math.max(1, G.cropE - G.cropS), 0, 1);
   c.fillStyle = 'rgba(255,255,255,0.12)'; c.fillRect(0, safe.t, VW, 3);
   c.fillStyle = COLORS[2]; c.fillRect(0, safe.t, VW * prog, 3);
   // life bar
