@@ -1,6 +1,6 @@
 # Onsetbeat
 
-A mobile rhythm game in the spirit of Osu! Tatakae! Ouendan, played on charts generated from your own music.
+A mobile rhythm game in the spirit of [Osu! Tatakae! Ouendan](https://en.wikipedia.org/wiki/Osu!_Tatakae!_Ouendan) (Nintendo DS, 2005), played on charts generated from your own music. To see what the original plays like, watch this [gameplay video](https://www.youtube.com/watch?v=eGJjIOFxhJ4).
 
 Pick an audio file and Onsetbeat analyses it entirely in the browser:
 
