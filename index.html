@@ -81,6 +81,7 @@ input[type=range]{width:100%;accent-color:var(--gold)}
 .actions{display:grid;grid-template-columns:2fr 1fr;gap:10px}
 .btn{font-family:var(--display);font-size:20px;border-radius:14px;padding:14px 16px;border:0;cursor:pointer;color:#1a1530;background:var(--gold)}
 .btn.ghost{background:transparent;color:var(--fg);border:1.5px solid var(--line);font-family:var(--body);font-weight:700;font-size:15px}
+.btn.small{font-size:14px;padding:8px 14px;flex:none}
 .btn:disabled{opacity:.45;cursor:default}
 .section{display:flex;flex-direction:column;gap:14px;border-top:1px solid var(--line);padding-top:22px}
 .marks{display:flex;flex-direction:column;gap:14px;margin:0;padding:0;list-style:none}
@@ -226,6 +227,7 @@ input[type=range]{width:100%;accent-color:var(--gold)}
       </div>
       <div class="opt"><label for="optSounds">Hit sounds<span class="hint">A clap on every good hit</span></label><input type="checkbox" class="switch" id="optSounds"></div>
       <div class="opt"><label for="optNofail">No fail<span class="hint">Keep playing when the life bar empties</span></label><input type="checkbox" class="switch" id="optNofail"></div>
+      <div class="opt"><div><b>Saved analyses</b><span class="hint">Kept on this device so a song you've played before opens without re-analysing. <span id="cacheInfo">–</span></span></div><button class="btn ghost small" id="cacheClear">Clear</button></div>
       <div class="offset">
         <div class="offset-row"><label for="optOffset"><b>Timing offset</b></label><output id="offOut">0 ms</output></div>
         <input type="range" id="optOffset" min="-250" max="250" step="5" value="0">
@@ -1012,6 +1014,74 @@ function probeDuration(file) {
   });
 }
 
+/* ---------- Analysis cache (IndexedDB, this device only) ---------- */
+// Bump ANALYSIS_VERSION whenever analyzeAudio changes, so older saved results are redone.
+const ANALYSIS_VERSION = 2, CACHE_MAX = 300;
+const cache = {
+  db: null,
+  open() {
+    if (this.db) return this.db;
+    this.db = new Promise(res => {
+      try {
+        const r = indexedDB.open('onsetbeat', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('analyses', { keyPath: 'fp' });
+        r.onsuccess = () => res(r.result);
+        r.onerror = r.onblocked = () => res(null);
+      } catch (e) { res(null); }
+    });
+    return this.db;
+  },
+  async tx(mode, fn) {
+    const db = await this.open(); if (!db) return null;
+    return new Promise(res => {
+      try {
+        const t = db.transaction('analyses', mode), st = t.objectStore('analyses'); let out = null;
+        fn(st, v => { out = v; });
+        t.oncomplete = () => res(out); t.onerror = t.onabort = () => res(null);
+      } catch (e) { res(null); }
+    });
+  },
+  async get(fp) {
+    const rec = await this.tx('readonly', (st, set) => { const r = st.get(fp); r.onsuccess = () => set(r.result || null); });
+    if (!rec || rec.v !== ANALYSIS_VERSION) return null;
+    this.tx('readwrite', st => { rec.usedAt = Date.now(); st.put(rec); });
+    return rec;
+  },
+  async put(fp, name, res) {
+    const ok = await this.tx('readwrite', (st, set) => { st.put({ fp, v: ANALYSIS_VERSION, name, res, bytes: approxBytes(res), savedAt: Date.now(), usedAt: Date.now() }); set(true); });
+    if (ok) this.trim();
+    return ok;
+  },
+  async list() { return (await this.tx('readonly', (st, set) => { const r = st.getAll(); r.onsuccess = () => set(r.result || []); })) || []; },
+  async trim() {
+    const all = await this.list(); if (all.length <= CACHE_MAX) return;
+    all.sort((a, b) => a.usedAt - b.usedAt);
+    const drop = all.slice(0, all.length - CACHE_MAX).map(r => r.fp);
+    await this.tx('readwrite', st => drop.forEach(k => st.delete(k)));
+  },
+  async clear() { await this.tx('readwrite', st => st.clear()); }
+};
+function approxBytes(res) {
+  let b = 0;
+  for (const k in res) { const v = res[k]; if (v && v.byteLength) b += v.byteLength; else if (Array.isArray(v)) b += v.length * (typeof v[0] === 'object' ? 40 : 8); }
+  return b;
+}
+// Same file → same fingerprint, whatever its name or folder: size plus a hash of its first and last 256 KB
+async function fingerprint(f) {
+  const K = 262144, head = await f.slice(0, K).arrayBuffer(), tail = await f.slice(Math.max(0, f.size - K)).arrayBuffer();
+  const buf = new Uint8Array(head.byteLength + tail.byteLength); buf.set(new Uint8Array(head), 0); buf.set(new Uint8Array(tail), head.byteLength);
+  let hex;
+  try { const d = await crypto.subtle.digest('SHA-256', buf); hex = [...new Uint8Array(d)].map(x => x.toString(16).padStart(2, '0')).join(''); }
+  catch (e) { let h1 = 2166136261, h2 = 5381; for (let i = 0; i < buf.length; i++) { h1 = Math.imul(h1 ^ buf[i], 16777619); h2 = (Math.imul(h2, 33) + buf[i]) | 0; } hex = (h1 >>> 0).toString(16) + (h2 >>> 0).toString(16); }
+  return f.size + ':' + hex;
+}
+async function showCacheInfo() {
+  const all = await cache.list(), cur = all.filter(r => r.v === ANALYSIS_VERSION);
+  const mb = cur.reduce((a, r) => a + (r.bytes || 0), 0) / 1e6;
+  $('#cacheInfo').textContent = cur.length ? `${cur.length} song${cur.length > 1 ? 's' : ''} · ${mb < 0.1 ? '<0.1' : mb.toFixed(1)} MB` : 'None yet';
+  $('#cacheClear').disabled = !all.length;
+}
+
 let current = null, currentMap = null, detailStart = 0, cropStart = 0;
 const CROP_LENS = [0, 60, 90, 120];
 const fmtTime = t => { t = Math.max(0, Math.round(t)); return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0'); };
@@ -1048,17 +1118,21 @@ function setStatus(text, p, err) {
   $('#statusBar').style.width = Math.round((p || 0) * 100) + '%';
   $('#statusBar').parentElement.hidden = !!err;
 }
-async function loadBuffer(name, buffer, isDemo, media) {
+async function loadBuffer(name, buffer, isDemo, media, cached, fp) {
   stopPreview();
   $('#play').disabled = $('#listen').disabled = true;
-  if (!isDemo) setStatus('Analysing rhythm…', 0.05);
-  const res = await runAnalysis(buffer, p => { if (!isDemo) setStatus('Analysing rhythm…', 0.05 + 0.9 * p); });
-  current = prepareAnalysis(Object.assign(res, { name, buffer: media ? null : buffer, isDemo }, media || {}));
+  let res = cached;
+  if (!res) {
+    if (!isDemo) setStatus('Analysing rhythm…', 0.05);
+    res = await runAnalysis(buffer, p => { if (!isDemo) setStatus('Analysing rhythm…', 0.05 + 0.9 * p); });
+    if (fp) cache.put(fp, name, { ...res }).then(showCacheInfo); // a plain copy: the page adds helper functions to res below
+  }
+  current = prepareAnalysis(Object.assign(res, { name, buffer: media ? null : buffer, isDemo, fromCache: !!cached }, media || {}));
   buffer = null;
   detailStart = 0; cropStart = 0;
   if (!isDemo) setStatus('');
   $('#trackName').textContent = name;
-  $('#trackTag').textContent = isDemo ? 'Demo' : 'Your song';
+  $('#trackTag').textContent = isDemo ? 'Demo' : cached ? 'Saved analysis' : 'Your song';
   $('#trackTag').classList.toggle('demo', isDemo);
   const lo = Math.round(current.bpmLo), hi = Math.round(current.bpmHi);
   $('#stBpm').innerHTML = (hi / lo > 1.06 ? lo + '–' + hi : Math.round(current.bpm)) + ' <small>bpm</small>';
@@ -1088,6 +1162,22 @@ async function handleFile(f) {
     stopPreview(true);
     // free the previous song before decoding the next one
     if (current) { releaseSong(current); current = null; currentMap = null; $('#play').disabled = $('#listen').disabled = true; }
+    const name = f.name.replace(/\.[^.]+$/, '');
+    let fp = null, rec = null;
+    try { fp = await fingerprint(f); rec = await cache.get(fp); } catch (e) {}
+    if (rec) {
+      const res = rec.res, long = res.duration > LONG_SONG;
+      if (long) { // nothing to decode: stream the original and reuse the saved analysis
+        const url = URL.createObjectURL(f), el = new Audio(); el.preload = 'auto'; el.src = url;
+        await loadBuffer(name, null, false, { media: el, mediaUrl: url }, res, fp);
+        return;
+      }
+      const t0 = performance.now(), tick = () => setStatus(`Saved analysis found. Decoding for playback… ${Math.round((performance.now() - t0) / 1000)} s`, 0.5);
+      tick(); const timer = setInterval(tick, 1000);
+      let buf; try { buf = await decodeFile(await f.arrayBuffer(), 44100); } finally { clearInterval(timer); }
+      await loadBuffer(name, buf, false, null, res, fp);
+      return;
+    }
     let est = await probeDuration(f);
     if (!est) est = f.size / 32000; // ~256 kbps guess when the browser can't read the length up front
     const long = est > LONG_SONG, t0 = performance.now();
@@ -1102,7 +1192,7 @@ async function handleFile(f) {
       const url = URL.createObjectURL(f), el = new Audio(); el.preload = 'auto'; el.src = url;
       media = { media: el, mediaUrl: url };
     }
-    await loadBuffer(f.name.replace(/\.[^.]+$/, ''), buf, false, media);
+    await loadBuffer(name, buf, false, media, null, fp);
   } catch (e) {
     setStatus(e && e.message === 'short' ? 'That clip is under 5 seconds. Pick a longer song.' : 'This browser could not decode that file, or ran out of memory. Try an MP3, an AAC M4A, or a shorter song.', 0, true);
     if (current) $('#play').disabled = $('#listen').disabled = false;
@@ -1241,6 +1331,8 @@ optS.addEventListener('change', () => { settings.sounds = optS.checked; store.se
 const syncBg = () => document.querySelectorAll('#bgSel button').forEach(b => b.setAttribute('aria-checked', String(b.dataset.bg === settings.bg)));
 syncBg();
 $('#bgSel').addEventListener('click', e => { const b = e.target.closest('button[data-bg]'); if (!b) return; settings.bg = b.dataset.bg; store.set('bg', settings.bg); syncBg(); });
+$('#cacheClear').addEventListener('click', async () => { await cache.clear(); showCacheInfo(); });
+showCacheInfo();
 optN.addEventListener('change', () => { settings.nofail = optN.checked; store.set('nofail', settings.nofail); });
 optO.addEventListener('input', () => { settings.offset = +optO.value; store.set('offset', settings.offset); showOff(); });
 

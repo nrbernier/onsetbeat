@@ -14,6 +14,8 @@ All illustrations are produced by the real analysis code, run on synthetic test 
 - The analysis uses a **mono, 11.025 kHz** copy. Onsets and beats live well below 5 kHz, and on the test tracks this gives the same results as 22 kHz. It also takes a quarter of the memory and runs twice as fast.
 - The audio is cut into **512-sample frames (46 ms) every 128 samples (11.6 ms)**, each with a Hann window. That gives about 86 analysis frames per second.
 
+**Saved analyses.** The result of steps 2–6 is stored in the browser's IndexedDB on the device, keyed by a fingerprint of the file (its size plus a SHA-256 of its first and last 256 KB), so a renamed copy is recognised too. It takes about 50 KB per minute of music; the 300 most recently used songs are kept. Each entry carries an analysis version number (`ANALYSIS_VERSION`), which must be raised whenever the analysis changes so old results are redone. Charts are always regenerated from the saved analysis, so changes to chart generation apply without clearing anything.
+
 **Playback is separate from the analysis.** Songs up to 8 minutes are decoded at full quality for playback. Longer songs play the original file, streamed through an `<audio>` element, so a 23-minute track never has to sit decoded in memory.
 
 ## 2. Onsets: when does something new start?
