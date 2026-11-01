@@ -16,7 +16,7 @@ All illustrations are produced by the real analysis code, run on synthetic test 
 
 **Saved analyses.** The result of steps 2–6 is stored in the browser's IndexedDB on the device, keyed by a fingerprint of the file (its size plus a SHA-256 of its first and last 256 KB), so a renamed copy is recognised too. It takes about 50 KB per minute of music; the 300 most recently used songs are kept. Each entry carries an analysis version number (`ANALYSIS_VERSION`), which must be raised whenever the analysis changes so old results are redone. Charts are always regenerated from the saved analysis, so changes to chart generation apply without clearing anything.
 
-**Playback is separate from the analysis.** Songs up to 8 minutes are decoded at full quality for playback. Longer songs play the original file, streamed through an `<audio>` element, so a 23-minute track never has to sit decoded in memory.
+**Playback is separate from the analysis.** Every song plays the original file, streamed through an `<audio>` element, so nothing is decoded at full quality: a song with a saved analysis opens almost instantly, and a 23-minute track never sits decoded in memory. Only the analysis needs decoded audio, and it decodes straight to mono 11 kHz.
 
 ## 2. Onsets: when does something new start?
 
@@ -121,8 +121,8 @@ Across 15,000 checked pairs of markers that share the screen, none overlap.
 
 ## 9. Timing during play
 
-- **Decoded songs:** the song clock is the Web Audio clock, refined with `getOutputTimestamp()` and corrected for the device's output latency.
-- **Streamed long songs:** the clock follows the `<audio>` element's time, smoothed against `performance.now()`. The lead-in before the first marker comes from a Web Audio delay line.
+- The song clock follows the `<audio>` element's time, smoothed against `performance.now()` (about 0.2 ms of jitter after smoothing), and corrected for the device's output latency. The lead-in before the first marker comes from a Web Audio delay line, which the element feeds into along with the analyser for the background.
+- Every song uses this same path (the demo is turned into a WAV and streamed too), so one timing offset is right for every song.
 - Taps are judged on the event's own timestamp, not the next animation frame. The windows are ±42–65 ms for 300, ±85–120 ms for 100 and ±125–180 ms for 50, depending on difficulty.
 - After each song, the median tap error is shown, and the timing offset can be set from it. This calibrates Bluetooth and other latency.
 

@@ -918,6 +918,17 @@ async function makeDemo() {
   return renderOffline(oc);
 }
 
+function toWav(buf) {
+  const ch = buf.numberOfChannels, n = buf.length, sr = buf.sampleRate, out = new DataView(new ArrayBuffer(44 + n * ch * 2));
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) out.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, 'RIFF'); out.setUint32(4, 36 + n * ch * 2, true); str(8, 'WAVE'); str(12, 'fmt '); out.setUint32(16, 16, true);
+  out.setUint16(20, 1, true); out.setUint16(22, ch, true); out.setUint32(24, sr, true); out.setUint32(28, sr * ch * 2, true);
+  out.setUint16(32, ch * 2, true); out.setUint16(34, 16, true); str(36, 'data'); out.setUint32(40, n * ch * 2, true);
+  const data = []; for (let c = 0; c < ch; c++) data.push(buf.getChannelData(c));
+  for (let i = 0, o = 44; i < n; i++) for (let c = 0; c < ch; c++, o += 2) out.setInt16(o, Math.max(-1, Math.min(1, data[c][i])) * 32767, true);
+  return new Blob([out], { type: 'audio/wav' });
+}
+
 /* ---------- Loading & analysis ---------- */
 const workerSrc = analyzeAudio.toString() + '\nself.onmessage=function(e){var r=analyzeAudio(e.data.pcm,e.data.sr,function(p){self.postMessage({type:"progress",p:p});});self.postMessage({type:"done",res:r});};';
 // Analysis runs on a mono 11.025 kHz copy (as accurate as 22 kHz for beats and onsets, a
@@ -949,15 +960,14 @@ async function toMono(buf) {
   const s = oc.createBufferSource(); s.buffer = buf; s.connect(oc.destination); s.start();
   return { pcm: (await renderOffline(oc)).getChannelData(0).slice(), sr: rate };
 }
-// Songs over 8 minutes are never decoded at full quality: the analysis gets a small 11 kHz
-// decode (~120 MB for 23 minutes instead of ~490 MB), and the game streams the original file.
-const LONG_SONG = 8 * 60;
+// Songs are never decoded at full quality: the analysis gets a small 11 kHz decode and the game
+// streams the original file, so one timing path (and one timing offset) serves every song.
 function decodeFile(ab, rate) {
   const { oc } = offlineCtx(2, rate, rate);
   return new Promise((res, rej) => { const p = oc.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
 }
 
-/* streamed playback of the original file (long songs), routed through Web Audio for visuals */
+/* streamed playback of the original file, routed through Web Audio for visuals */
 function mediaGraph(an) {
   if (an.graph) return an.graph;
   const ctx = ensureCtx();
@@ -1001,17 +1011,6 @@ function releaseSong(an) {
   if (an.graph) { try { an.graph.src.disconnect(); an.graph.analyser.disconnect(); } catch (e) {} }
   if (an.media) { an.media.removeAttribute('src'); try { an.media.load(); } catch (e) {} URL.revokeObjectURL(an.mediaUrl); }
   an.buffer = null; an.media = null;
-}
-function probeDuration(file) {
-  return new Promise(res => {
-    const a = new Audio(), u = URL.createObjectURL(file);
-    const done = v => { URL.revokeObjectURL(u); a.removeAttribute('src'); res(v); };
-    a.preload = 'metadata';
-    a.onloadedmetadata = () => done(isFinite(a.duration) ? a.duration : 0);
-    a.onerror = () => done(0);
-    setTimeout(() => done(0), 4000);
-    a.src = u;
-  });
 }
 
 /* ---------- Analysis cache (IndexedDB, this device only) ---------- */
@@ -1163,36 +1162,18 @@ async function handleFile(f) {
     // free the previous song before decoding the next one
     if (current) { releaseSong(current); current = null; currentMap = null; $('#play').disabled = $('#listen').disabled = true; }
     const name = f.name.replace(/\.[^.]+$/, '');
+    // every song plays from the original file, streamed; only the analysis needs decoded audio
+    const stream = () => { const url = URL.createObjectURL(f), el = new Audio(); el.preload = 'auto'; el.src = url; return { media: el, mediaUrl: url }; };
     let fp = null, rec = null;
     try { fp = await fingerprint(f); rec = await cache.get(fp); } catch (e) {}
-    if (rec) {
-      const res = rec.res, long = res.duration > LONG_SONG;
-      if (long) { // nothing to decode: stream the original and reuse the saved analysis
-        const url = URL.createObjectURL(f), el = new Audio(); el.preload = 'auto'; el.src = url;
-        await loadBuffer(name, null, false, { media: el, mediaUrl: url }, res, fp);
-        return;
-      }
-      const t0 = performance.now(), tick = () => setStatus(`Saved analysis found. Decoding for playback… ${Math.round((performance.now() - t0) / 1000)} s`, 0.5);
-      tick(); const timer = setInterval(tick, 1000);
-      let buf; try { buf = await decodeFile(await f.arrayBuffer(), 44100); } finally { clearInterval(timer); }
-      await loadBuffer(name, buf, false, null, res, fp);
-      return;
-    }
-    let est = await probeDuration(f);
-    if (!est) est = f.size / 32000; // ~256 kbps guess when the browser can't read the length up front
-    const long = est > LONG_SONG, t0 = performance.now();
-    const label = long ? `Preparing a ${Math.round(est / 60)}-minute song for analysis` : 'Decoding ' + f.name;
-    const tick = () => setStatus(`${label}… ${Math.round((performance.now() - t0) / 1000)} s`, 0.03);
+    if (rec) { await loadBuffer(name, null, false, stream(), rec.res, fp); return; }
+    // a small mono 11 kHz decode is all the analysis needs, and much quicker than a full-quality one
+    const t0 = performance.now(), tick = () => setStatus(`Reading ${f.name}… ${Math.round((performance.now() - t0) / 1000)} s`, 0.03);
     tick(); const timer = setInterval(tick, 1000);
     let buf;
-    try { buf = await decodeFile(await f.arrayBuffer(), long ? ANALYSIS_RATE : 44100); } finally { clearInterval(timer); }
+    try { buf = await decodeFile(await f.arrayBuffer(), ANALYSIS_RATE); } finally { clearInterval(timer); }
     if (!buf || buf.duration < 5) throw new Error('short');
-    let media = null;
-    if (long) { // play the original file, streamed, instead of holding it decoded in memory
-      const url = URL.createObjectURL(f), el = new Audio(); el.preload = 'auto'; el.src = url;
-      media = { media: el, mediaUrl: url };
-    }
-    await loadBuffer(name, buf, false, media, null, fp);
+    await loadBuffer(name, buf, false, stream(), null, fp);
   } catch (e) {
     setStatus(e && e.message === 'short' ? 'That clip is under 5 seconds. Pick a longer song.' : 'This browser could not decode that file, or ran out of memory. Try an MP3, an AAC M4A, or a shorter song.', 0, true);
     if (current) $('#play').disabled = $('#listen').disabled = false;
@@ -1869,7 +1850,10 @@ function drawHud(c, now, perf) {
 
 /* ---------- Boot: synthesise and analyse the demo beat ---------- */
 (async () => {
-  try { await loadBuffer('Demo beat · 112 bpm synth groove', await makeDemo(), true); }
+  try {
+    const buf = await makeDemo(), url = URL.createObjectURL(toWav(buf)), el = new Audio(); el.preload = 'auto'; el.src = url;
+    await loadBuffer('Demo beat · 112 bpm synth groove', buf, true, { media: el, mediaUrl: url });
+  }
   catch (e) { $('#trackName').textContent = 'Choose a song to start'; }
 })();
 </script>

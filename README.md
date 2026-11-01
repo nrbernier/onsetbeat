@@ -18,6 +18,6 @@ How each step works, with illustrations: [docs/analysis.md](docs/analysis.md).
 
 The close-up view shows onset strength, the beat grid and the generated chart, and "Hear the chart" plays the song with a click on every marker.
 
-The analysis runs on a mono 11 kHz copy of the song. Short songs play from a full-quality decode; songs over 8 minutes stream the original file, so a 23-minute track never has to sit decoded in memory.
+The analysis runs on a mono 11 kHz copy of the song and is saved on the device, so a song opens instantly the next time. Playback always streams the original file at full quality.
 
 No build step and no dependencies: `index.html` is the whole app, so it runs as is on GitHub Pages. Audio files never leave the device.
