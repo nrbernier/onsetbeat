@@ -323,7 +323,18 @@ function analyzeAudio(x, sr, report) {
   const smooth = a => { const o = new Float32Array(a.length); for (let i = 0; i < a.length; i++) o[i] = 0.25 * a[Math.max(0, i - 1)] + 0.5 * a[i] + 0.25 * a[Math.min(a.length - 1, i + 1)]; return o; };
   const pct = (a, q) => { const s = Float32Array.from(a).sort(); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; };
   const normP = (a) => { const p = pct(a, 0.95) || Math.max(...a) || 1; for (let i = 0; i < a.length; i++) a[i] /= p; return a; };
-  const env = normP(smooth(flux)), lowE = normP(smooth(lowF)), highE = normP(smooth(highF));
+  // Each curve is divided by its own level over the surrounding ±4 s, so a hit is judged against
+  // the music around it: quiet intros and loud climaxes produce comparable onset strengths.
+  // The floor (a fraction of the song-wide level) stops near-silence from being blown up into noise.
+  const localNorm = a => {
+    const W = Math.round(4 / hopT), c = new Float64Array(a.length + 1);
+    for (let i = 0; i < a.length; i++) c[i + 1] = c[i] + a[i];
+    let g = 0; for (let i = 0; i < a.length; i++) g += a[i]; g /= a.length;
+    const o = new Float32Array(a.length);
+    for (let i = 0; i < a.length; i++) { const lo = Math.max(0, i - W), hi = Math.min(a.length, i + W + 1); o[i] = a[i] / Math.max((c[hi] - c[lo]) / (hi - lo), 0.2 * g, 1e-9); }
+    return o;
+  };
+  const env = normP(localNorm(smooth(flux))), lowE = normP(localNorm(smooth(lowF))), highE = normP(localNorm(smooth(highF)));
 
   // 2. Peak picking with an adaptive threshold -> onsets
   const cs = new Float64Array(n + 1);
@@ -616,20 +627,36 @@ function generateMap(an, key, aspect) {
     if (g.s <= 0 || g.level > D.maxLevel || an.rmsAt(g.t) < an.silence) continue;
     cands.push({ i, sc: g.s / Math.max(lm[i], 0.35 * gHi) * LEVEL_W[g.level] + rng() * 1e-3 });
   }
+  // Notes are budgeted per 8-beat window instead of across the whole song, so a loud ending
+  // can't use up the notes meant for a quiet opening. Louder windows get a little more
+  // (from 70% to 115% of the base density), which keeps some build-up without starving the start.
+  const WB = 8, nB = an.beats.length, nWin = Math.ceil(nB / WB);
+  const budget = new Float32Array(nWin);
+  for (let w = 0; w < nWin; w++) {
+    let beats = 0, sec = 0, loud = 0;
+    for (let i = w * WB; i < Math.min(nB - 1, (w + 1) * WB); i++) {
+      const r = an.rmsAt(an.beats[i]);
+      if (r < an.silence) continue;
+      beats++; sec += an.beats[i + 1] - an.beats[i]; loud += Math.min(1, r / an.rmsP90);
+    }
+    const lf = beats ? 0.7 + 0.45 * Math.sqrt(loud / beats) : 0;
+    budget[w] = Math.min(D.perBeat * beats, D.perSec * sec) * lf;
+  }
+  // spread fractional budgets so they add up correctly over the song
+  const quota = new Int32Array(nWin); { let carry = 0; for (let w = 0; w < nWin; w++) { const v = budget[w] + carry; quota[w] = Math.floor(v); carry = v - quota[w]; } }
   cands.sort((a, b) => b.sc - a.sc);
-  let activeBeats = 0, activeSec = 0;
-  for (let i = 0; i < an.beats.length - 1; i++) if (an.rmsAt(an.beats[i]) >= an.silence) { activeBeats++; activeSec += an.beats[i + 1] - an.beats[i]; }
-  const target = Math.max(4, Math.round(Math.min(D.perBeat * activeBeats, D.perSec * activeSec)));
   // minimum spacing in beats; a triplet eighth (1/3) passes where a straight eighth (1/2) is allowed
   const gapB = D.minGap / 4 * 0.65;
-  const taken = new Uint8Array(n), picks = [];
+  const taken = new Uint8Array(n), picks = [], used = new Int32Array(nWin);
   for (const c of cands) {
-    if (picks.length >= target || c.sc < 0.1) break;
+    if (c.sc < 0.1) break;
+    const w = Math.min(nWin - 1, Math.floor(G[c.i].beat / WB));
+    if (used[w] >= quota[w]) continue;
     let ok = true;
     for (let k = c.i - 1; ok && k >= 0 && G[c.i].beat - G[k].beat < gapB; k--) if (taken[k]) ok = false;
     for (let k = c.i + 1; ok && k < n && G[k].beat - G[c.i].beat < gapB; k++) if (taken[k]) ok = false;
     if (!ok) continue;
-    taken[c.i] = 1; picks.push(c.i);
+    taken[c.i] = 1; picks.push(c.i); used[w]++;
   }
   picks.sort((a, b) => a - b);
 

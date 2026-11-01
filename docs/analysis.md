@@ -22,14 +22,16 @@ For every frame, the spectrum is grouped into **40 mel-spaced bands** (35 Hz up 
 
 Mel bands matter here. With raw FFT bins, most bins sit above 3 kHz, so hi-hats and cymbals swamped the kick drum, and the beat tracker locked onto the off-beats. With 40 bands, the low end gets a fair share.
 
-The flux is smoothed, then normalised so its 95th percentile is 1. An **onset** is a frame that:
+The flux is smoothed, then **divided by its own average over the surrounding ±4 seconds**, so each hit is judged against the music around it rather than against the loudest part of the song. Without this, a track that builds up (quiet piano intro, loud ending) had almost no onsets at the start. The divisor never drops below 20% of the song-wide average, so near-silence isn't blown up into noise. The result is scaled so its 95th percentile is 1.
+
+An **onset** is a frame that:
 
 - is the highest value within ±3 frames (±35 ms),
 - is above **the local mean (−140 ms … +80 ms) + 0.07**,
 - is above 0.08 overall,
 - and is at least 46 ms after the previous onset. If two onsets are closer than that, the stronger one is kept.
 
-Two extra flux curves are kept, for the low band (below 180 Hz, kicks and bass) and the high band (above 3 kHz, hats and snares). They are used later for the downbeat and the meter.
+Two extra flux curves, normalised the same way, are kept for the low band (below 180 Hz, kicks and bass) and the high band (above 3 kHz, hats and snares). They are used later for the downbeat and the meter.
 
 ![Onset strength, threshold, onsets and beats](img/2-onsets-beats.svg)
 
@@ -80,9 +82,11 @@ On the test tracks this detects 3/4, 4/4, 5/4 and 7/4 correctly, and finds both 
 
 Every grid point collects the strongest onset that snaps to it. Each grid point then gets a **score**: its strength divided by the strongest onset within ±8 beats, so quiet passages still get notes. That is multiplied by a metric weight: downbeat 1.3, beat 1.1, eighth/triplet 0.85, sixteenth 0.6.
 
-Points are taken from the highest score down, until a per-difficulty target is reached:
+Notes are budgeted **per 8-beat window**, not across the whole song. Each window's budget comes from the difficulty's density (table below) times a loudness factor between 0.7 (quiet) and 1.15 (loudest), so a climax is a little denser but a loud ending can't take the notes meant for a quiet opening. Within each window, points are taken from the highest score down until its budget is used.
 
-| Difficulty | Grid used | Min. spacing | Target density |
+On *Breach* (Neil Cowley Trio), which grows from soft piano to a loud ending, Normal went from 23 vs 75 markers per 30 s (start vs end) to 37 vs 47.
+
+| Difficulty | Grid used | Min. spacing | Base density |
 |---|---|---|---|
 | Easy | beats only | ~1 beat | 0.5 per beat, max 1.2/s |
 | Normal | + eighths/triplets | ~⅓ beat | 0.8 per beat, max 2.1/s |
