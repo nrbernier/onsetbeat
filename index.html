@@ -56,7 +56,7 @@ h2{font-family:var(--display);font-weight:400;font-size:22px;margin:0;text-wrap:
 dl{margin:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
 dl>div{display:flex;flex-direction:column;gap:2px;min-width:0}
 dt{font-size:11px}
-dd{margin:0;font-family:var(--mono);font-size:20px;font-variant-numeric:tabular-nums;white-space:nowrap}
+dd{margin:0;font-family:var(--mono);font-size:19px;line-height:1.3;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 dd small{font-size:12px;color:var(--muted)}
 .viz{display:flex;flex-direction:column;gap:8px}
 canvas.an{width:100%;display:block;border-radius:10px;background:#120f24;touch-action:pan-y}
@@ -146,7 +146,7 @@ input[type=range]{width:100%;accent-color:var(--gold)}
       <div><dt>Tempo</dt><dd id="stBpm">–</dd></div>
       <div><dt>Length</dt><dd id="stLen">–</dd></div>
       <div><dt>Onsets</dt><dd id="stOn">–</dd></div>
-      <div><dt>Beats</dt><dd id="stBeats">–</dd></div>
+      <div><dt>Meter</dt><dd id="stMeter">–</dd></div>
     </dl>
     <div class="viz">
       <div class="viz-label">Whole song: loudness and chart</div>
@@ -160,6 +160,7 @@ input[type=range]{width:100%;accent-color:var(--gold)}
         <span><i style="background:var(--gold)"></i>Tap</span>
         <span><i class="bar" style="background:var(--sky)"></i>Phrase</span>
         <span><i class="bar sq" style="background:var(--red)"></i>Spin</span>
+        <span><i class="sq" style="background:var(--mint);width:3px"></i>Triplet grid</span>
       </div>
     </div>
     <div class="diffs" role="radiogroup" aria-label="Difficulty" id="diffs">
@@ -315,7 +316,7 @@ function analyzeAudio(x, sr, report) {
   }
   if (report) report(0.8);
 
-  // 3. Tempo: autocorrelation of the onset novelty, weighted toward ~115 BPM
+  // 3. Tempo: autocorrelation of the onset novelty, weighted toward ~115 BPM (global estimate)
   const nov = new Float32Array(n);
   for (let i = 0; i < n; i++) { const a = Math.max(0, i - 16), b = Math.min(n, i + 17); nov[i] = Math.max(0, env[i] - (cs[b] - cs[a]) / (b - a)); }
   const minL = Math.max(2, Math.floor(60 / (210 * hopT))), maxL = Math.ceil(60 / (50 * hopT));
@@ -330,23 +331,65 @@ function analyzeAudio(x, sr, report) {
   let P = bestL;
   { const y0 = ac[bestL - 1], y1 = ac[bestL], y2 = ac[bestL + 1], den = y0 - 2 * y1 + y2;
     if (den < 0) P = bestL + Math.max(-0.5, Math.min(0.5, 0.5 * (y0 - y2) / den)); }
-  if (report) report(0.86);
+  if (report) report(0.82);
 
-  // 4. Beat tracking by dynamic programming (Ellis 2007)
+  // 3b. Local tempo: autocorrelation in 8 s windows, then a Viterbi path so tempo can change
+  //     mid-song but cannot flicker or jump octaves on a whim
+  const winF = Math.min(n, Math.round(8 / hopT)), hopW = Math.max(1, Math.round(1 / hopT));
+  const nW = Math.max(1, Math.floor((n - winF) / hopW) + 1), NL = maxL - minL + 1;
+  const emis = new Float32Array(nW * NL), wac = new Float32Array(2 * maxL + 3);
+  for (let w = 0; w < nW; w++) {
+    const s0 = w * hopW, s1 = s0 + winF;
+    for (let L = minL; L <= 2 * maxL + 2; L++) {
+      let s = 0; for (let i = s0; i + L < s1; i++) s += nov[i] * nov[i + L];
+      wac[L] = s / Math.max(1, winF - L);
+    }
+    let mx = 0;
+    for (let j = 0; j < NL; j++) {
+      const L = minL + j, pr = Math.exp(-0.5 * Math.pow(Math.log2(60 / (L * hopT) / 115) / 0.9, 2));
+      const v = pr * (wac[L] + 0.5 * wac[2 * L]); emis[w * NL + j] = v; if (v > mx) mx = v;
+    }
+    for (let j = 0; j < NL; j++) emis[w * NL + j] = mx > 0 ? emis[w * NL + j] / mx : 1;
+  }
+  const lagOf = new Float32Array(NL);
+  { const LAM = 8; let sc = new Float32Array(NL), nsc = new Float32Array(NL); const bk = new Int16Array(nW * NL);
+    for (let j = 0; j < NL; j++) sc[j] = emis[j];
+    const tr = new Float32Array(NL * NL);
+    for (let i = 0; i < NL; i++) for (let j = 0; j < NL; j++) tr[i * NL + j] = -LAM * Math.log2((minL + i) / (minL + j)) ** 2;
+    for (let w = 1; w < nW; w++) {
+      for (let j = 0; j < NL; j++) {
+        let b = -Infinity, bi = 0;
+        for (let i = 0; i < NL; i++) { const v = sc[i] + tr[i * NL + j]; if (v > b) { b = v; bi = i; } }
+        nsc[j] = b + emis[w * NL + j]; bk[w * NL + j] = bi;
+      }
+      const t = sc; sc = nsc; nsc = t;
+    }
+    let j = 0; for (let k = 1; k < NL; k++) if (sc[k] > sc[j]) j = k;
+    const path = new Int16Array(nW);
+    for (let w = nW - 1; w >= 0; w--) { path[w] = j; if (w > 0) j = bk[w * NL + j]; }
+    var wPath = path;
+  }
+  const Pl = new Float32Array(n); // local beat period (frames) for every frame
+  for (let f = 0; f < n; f++) {
+    const wpos = clampN((f - winF / 2) / hopW, 0, nW - 1), w0 = Math.floor(wpos), w1 = Math.min(nW - 1, w0 + 1), u = wpos - w0;
+    Pl[f] = (minL + wPath[w0]) * (1 - u) + (minL + wPath[w1]) * u;
+  }
+  function clampN(v, a, b) { return v < a ? a : v > b ? b : v; }
+  if (report) report(0.88);
+
+  // 4. Beat tracking by dynamic programming (Ellis 2007), with the local period at each frame
   let mean = 0; for (let i = 0; i < n; i++) mean += nov[i]; mean /= n;
   let sd = 0; for (let i = 0; i < n; i++) sd += (nov[i] - mean) ** 2; sd = Math.sqrt(sd / n) || 1;
   const sig = Math.max(1, P / 32), gr = Math.ceil(3 * sig), gw = [];
   for (let k = -gr; k <= gr; k++) gw.push(Math.exp(-0.5 * (k / sig) ** 2));
   const ls = new Float32Array(n); let lsMax = 0;
   for (let i = 0; i < n; i++) { let s = 0; for (let k = -gr; k <= gr; k++) { const j = i + k; if (j >= 0 && j < n) s += nov[j] / sd * gw[k + gr]; } ls[i] = s; if (s > lsMax) lsMax = s; }
-  const lo = Math.max(1, Math.round(P / 2)), hi = Math.round(2 * P);
-  const pen = new Float32Array(hi + 1);
-  for (let d = lo; d <= hi; d++) pen[d] = -100 * Math.log(d / P) ** 2;
   const cum = new Float32Array(n), back = new Int32Array(n).fill(-1);
   let started = false;
   for (let t = 0; t < n; t++) {
+    const Pt0 = Pl[t], lo = Math.max(1, Math.round(Pt0 / 2)), hi = Math.round(2 * Pt0);
     let best = -Infinity, bi = -1;
-    for (let d = lo; d <= hi; d++) { const p = t - d; if (p < 0) break; const v = cum[p] + pen[d]; if (v > best) { best = v; bi = p; } }
+    for (let d = lo; d <= hi; d++) { const p = t - d; if (p < 0) break; const v = cum[p] - 100 * Math.log(d / Pt0) ** 2; if (v > best) { best = v; bi = p; } }
     if (started && bi >= 0) { cum[t] = ls[t] + best; back[t] = bi; } else cum[t] = ls[t];
     if (!started && ls[t] > 0.01 * lsMax) started = true;
   }
@@ -360,32 +403,106 @@ function analyzeAudio(x, sr, report) {
     for (let t = tail; t >= 0; t = back[t]) beatF.push(t);
     beatF.reverse();
   }
-  const Pt = P * hopT, dur = x.length / sr;
+  const dur = x.length / sr, PtAt = t => Pl[clampN(Math.round((t - off) / hopT), 0, n - 1)] * hopT;
   let beats = beatF.map(f => off + f * hopT);
-  if (beats.length < 2) { beats = []; for (let t = 0.1; t < dur; t += Pt) beats.push(t); }
+  if (beats.length < 2) { beats = []; for (let t = 0.1; t < dur; t += PtAt(t)) beats.push(t); }
   // fill skipped beats, then extend the grid to cover the whole song
   const filled = [beats[0]];
   for (let i = 1; i < beats.length; i++) {
-    const g = beats[i] - beats[i - 1], m = Math.round(g / Pt);
+    const g = beats[i] - beats[i - 1], m = Math.round(g / PtAt((beats[i] + beats[i - 1]) / 2));
     for (let k = 1; k < m; k++) filled.push(beats[i - 1] + g * k / m);
     filled.push(beats[i]);
   }
   beats = filled;
-  while (beats[0] - Pt > 0.02) beats.unshift(beats[0] - Pt);
-  while (beats[beats.length - 1] + Pt < dur - 0.05) beats.push(beats[beats.length - 1] + Pt);
+  while (beats[0] - PtAt(beats[0]) > 0.02) beats.unshift(beats[0] - PtAt(beats[0]));
+  while (beats[beats.length - 1] + PtAt(beats[beats.length - 1]) < dur - 0.05) beats.push(beats[beats.length - 1] + PtAt(beats[beats.length - 1]));
+  const nb = beats.length;
+  const fAt = (t, arr) => { const f = Math.round((t - off) / hopT); let m = 0; for (let j = Math.max(0, f - 2); j <= Math.min(n - 1, f + 2); j++) if (arr[j] > m) m = arr[j]; return m; };
+  const blen = i => i < nb - 1 ? beats[i + 1] - beats[i] : (i > 0 ? beats[i] - beats[i - 1] : P * hopT);
+  if (report) report(0.93);
 
-  // 5. Bar phase: the beat position with the most low-end (kick) energy is the downbeat
-  const phase = [0, 0, 0, 0];
-  for (let i = 0; i < beats.length; i++) {
-    const f = Math.round((beats[i] - off) / hopT); let m = 0;
-    for (let j = Math.max(0, f - 2); j <= Math.min(n - 1, f + 2); j++) m = Math.max(m, lowE[j] + 0.3 * env[j]);
-    phase[i % 4] += m;
+  // 5. Swing / triplet feel: per beat, do the off-beat onsets sit on quarters or on thirds?
+  const sub = new Uint8Array(nb).fill(4);
+  { const v = new Float32Array(nb), wt = new Float32Array(nb); let oi = 0;
+    for (let i = 0; i < nb - 1; i++) {
+      const b0 = beats[i], L = blen(i);
+      while (oi < onsets.length && onsets[oi].t < b0 + 0.08 * L) oi++;
+      for (let j = oi; j < onsets.length && onsets[j].t < b0 + 0.92 * L; j++) {
+        const u = (onsets[j].t - b0) / L, s = onsets[j].s;
+        const d4 = Math.min(Math.abs(u - 0.25), Math.abs(u - 0.5), Math.abs(u - 0.75)), d3 = Math.min(Math.abs(u - 1 / 3), Math.abs(u - 2 / 3));
+        v[i] += s * (d4 - d3); wt[i] += s;
+      }
+    }
+    for (let i = 0; i < nb; i++) {
+      let V = 0, W = 0;
+      for (let j = Math.max(0, i - 3); j <= Math.min(nb - 1, i + 3); j++) { V += v[j]; W += wt[j]; }
+      if (W > 0.3 && V / W > 0.025) sub[i] = 3;
+    }
   }
-  const downPhase = phase.indexOf(Math.max(...phase));
-  // average spacing over the tracked span gives a finer tempo than the frame-quantised median
-  const beatDur = beatF.length >= 8 ? (beatF[beatF.length - 1] - beatF[0]) * hopT / (beatF.length - 1) : Pt;
+
+  // 6. Meter per section: which bar length (3, 4, 5 or 7 beats) makes the beat patterns repeat,
+  //    smoothed with a Viterbi pass so the meter only changes with strong evidence
+  const feat = [], acc = new Float32Array(nb);
+  for (let i = 0; i < nb; i++) {
+    const L = blen(i), v = [];
+    for (let k = 0; k < 4; k++) { const t = beats[i] + k * L / 4; v.push(fAt(t, lowE), fAt(t, env), fAt(t, highE)); }
+    let nn = 0; for (const a of v) nn += a * a; nn = Math.sqrt(nn);
+    feat.push(nn > 1e-6 ? v.map(a => a / nn) : null);
+    acc[i] = fAt(beats[i], lowE) + 0.3 * fAt(beats[i], env);
+  }
+  const MS = [3, 4, 5, 7], MPRI = [0.02, 0.06, 0, -0.02], HW = 12, NM = MS.length;
+  const mEm = new Float32Array(nb * NM);
+  for (let i = 0; i < nb; i++) {
+    const a = Math.max(0, i - HW), b = Math.min(nb - 1, i + HW);
+    let am = 0; for (let j = a; j <= b; j++) am += acc[j]; am /= (b - a + 1);
+    for (let k = 0; k < NM; k++) {
+      const m = MS[k]; let ss = 0, sc = 0, num = 0, den = 1e-9;
+      for (let j = a; j + m <= b; j++) {
+        const f1 = feat[j], f2 = feat[j + m];
+        if (f1 && f2) { let d = 0; for (let q = 0; q < f1.length; q++) d += f1[q] * f2[q]; ss += d; }
+        sc++;
+        num += (acc[j] - am) * (acc[j + m] - am);
+      }
+      for (let j = a; j <= b; j++) den += (acc[j] - am) ** 2;
+      mEm[i * NM + k] = (sc ? ss / sc : 0) + 0.5 * num / den + MPRI[k];
+    }
+  }
+  const mOf = new Uint8Array(nb);
+  { const SW = 2.5; let s = new Float32Array(NM), ns = new Float32Array(NM); const bk = new Uint8Array(nb * NM);
+    for (let k = 0; k < NM; k++) s[k] = mEm[k];
+    for (let i = 1; i < nb; i++) {
+      for (let k = 0; k < NM; k++) {
+        let b = -Infinity, bi = 0;
+        for (let q = 0; q < NM; q++) { const v = s[q] - (q === k ? 0 : SW); if (v > b) { b = v; bi = q; } }
+        ns[k] = b + mEm[i * NM + k]; bk[i * NM + k] = bi;
+      }
+      const t = s; s = ns; ns = t;
+    }
+    let k = 0; for (let q = 1; q < NM; q++) if (s[q] > s[k]) k = q;
+    for (let i = nb - 1; i >= 0; i--) { mOf[i] = k; if (i > 0) k = bk[i * NM + k]; }
+  }
+  // sections of constant meter, each with its own downbeat phase (most kick energy)
+  const meters = [], barPos = new Int8Array(nb), barIdx = new Int32Array(nb);
+  let bar = -1;
+  for (let s0 = 0; s0 < nb;) {
+    let s1 = s0; while (s1 < nb && mOf[s1] === mOf[s0]) s1++;
+    const m = MS[mOf[s0]];
+    let bp = 0, bv = -1;
+    for (let p = 0; p < m; p++) {
+      let s = 0, c = 0;
+      for (let i = s0 + p; i < s1; i += m) { s += acc[i]; c++; }
+      if (c && s / c > bv) { bv = s / c; bp = p; }
+    }
+    meters.push({ beat: s0, m });
+    for (let i = s0; i < s1; i++) { const pos = ((i - s0 - bp) % m + m) % m; barPos[i] = pos; if (pos === 0) bar++; barIdx[i] = Math.max(0, bar); }
+    s0 = s1;
+  }
+
+  const ints = []; for (let i = 1; i < nb; i++) ints.push(beats[i] - beats[i - 1]);
+  ints.sort((a, b) => a - b);
+  const beatDur = ints.length ? ints[ints.length >> 1] : P * hopT;
   if (report) report(1);
-  return { hopT, off, env, rms, onsets, beats, downPhase, beatDur, bpm: 60 / beatDur, duration: dur };
+  return { hopT, off, env, rms, onsets, beats, beatDur, bpm: 60 / beatDur, duration: dur, sub, barPos, barIdx, meters };
 }
 
 /* ---------- Chart generation ---------- */
@@ -411,14 +528,17 @@ function prepareAnalysis(an) {
   let em = 0, ec = 0;
   for (let i = 0; i < nF; i++) if (an.rms[i] >= an.silence) { em += an.env[i]; ec++; }
   an.envMean = ec ? em / ec : 0.2;
-  // sixteenth-note grid between tracked beats; level 0 = downbeat … 3 = sixteenth
-  const B = an.beats, G = [];
-  const lvlBeat = i => ((i - an.downPhase) % 4 + 4) % 4 === 0 ? 0 : 1;
-  for (let i = 0; i < B.length - 1; i++) {
-    const d = (B[i + 1] - B[i]) / 4;
-    for (let k = 0; k < 4; k++) G.push({ t: B[i] + k * d, beat: i + k / 4, level: k === 0 ? lvlBeat(i) : (k === 2 ? 2 : 3), s: 0 });
+  const B = an.beats, nb = B.length;
+  an.beatIdxAt = t => { let lo = 0, hi = nb - 1; if (t <= B[0]) return 0; if (t >= B[hi]) return hi; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (B[m] <= t) lo = m; else hi = m; } return lo; };
+  an.beatLenAt = t => { const i = Math.min(an.beatIdxAt(t), nb - 2); return nb > 1 ? B[i + 1] - B[i] : an.beatDur; };
+  an.timeOfBeat = bf => { const i = clamp(Math.floor(bf), 0, nb - 2), f = bf - i; return B[i] + f * (B[i + 1] - B[i]); };
+  // grid: each beat split in 4 (straight) or 3 (triplet/swing); level 0 = downbeat … 3 = sixteenth
+  const G = [];
+  for (let i = 0; i < nb - 1; i++) {
+    const sub = an.sub[i] || 4, d = (B[i + 1] - B[i]) / sub;
+    for (let k = 0; k < sub; k++) G.push({ t: B[i] + k * d, beat: i + k / sub, level: k === 0 ? (an.barPos[i] === 0 ? 0 : 1) : (sub === 3 ? 2 : (k === 2 ? 2 : 3)), s: 0, tri: sub === 3 });
   }
-  G.push({ t: B[B.length - 1], beat: B.length - 1, level: lvlBeat(B.length - 1), s: 0 });
+  G.push({ t: B[nb - 1], beat: nb - 1, level: an.barPos[nb - 1] === 0 ? 0 : 1, s: 0, tri: false });
   for (const o of an.onsets) {
     let lo = 0, hi = G.length - 1;
     while (hi - lo > 1) { const m = (lo + hi) >> 1; if (G[m].t < o.t) lo = m; else hi = m; }
@@ -426,6 +546,16 @@ function prepareAnalysis(an) {
     g.s = Math.max(g.s, o.s);
   }
   an.grid = G;
+  // tempo summary: smoothed per-beat BPM, reported as a range when it moves
+  const bpms = [];
+  for (let i = 4; i < nb - 4; i++) bpms.push(60 * 8 / (B[i + 4] - B[i - 4]));
+  bpms.sort((a, b) => a - b);
+  an.bpmLo = bpms.length ? bpms[Math.floor(bpms.length * 0.1)] : an.bpm;
+  an.bpmHi = bpms.length ? bpms[Math.floor(bpms.length * 0.9)] : an.bpm;
+  const mCount = {}; an.meters.forEach((m, k) => { const e = k + 1 < an.meters.length ? an.meters[k + 1].beat : nb; mCount[m.m] = (mCount[m.m] || 0) + e - m.beat; });
+  an.meterList = Object.keys(mCount).filter(m => mCount[m] >= 8).sort((a, b) => mCount[b] - mCount[a]).map(Number);
+  if (!an.meterList.length) an.meterList = [4];
+  an.swingShare = an.sub.reduce((a, v) => a + (v === 3 ? 1 : 0), 0) / Math.max(1, nb);
   return an;
 }
 
@@ -446,7 +576,7 @@ function generateMap(an, key, aspect) {
   const rng = mulberry32(hashStr(an.name + '|' + key + '|' + an.duration.toFixed(2)));
   // strength relative to the loudest onset within ±8 beats, so quiet sections still get notes
   const lm = new Float32Array(n);
-  for (let i = 0; i < n; i++) { let m = 0; for (let j = Math.max(0, i - 32); j <= Math.min(n - 1, i + 32); j++) if (G[j].s > m) m = G[j].s; lm[i] = m; }
+  { let j0 = 0, j1 = 0; for (let i = 0; i < n; i++) { while (G[j0].beat < G[i].beat - 8) j0++; while (j1 < n - 1 && G[j1 + 1].beat <= G[i].beat + 8) j1++; let m = 0; for (let j = j0; j <= j1; j++) if (G[j].s > m) m = G[j].s; lm[i] = m; } }
   const nz = G.filter(g => g.s > 0).map(g => g.s).sort((a, b) => a - b);
   const gHi = nz.length ? nz[Math.floor(nz.length * 0.95)] : 1;
   const cands = [];
@@ -456,41 +586,47 @@ function generateMap(an, key, aspect) {
     cands.push({ i, sc: g.s / Math.max(lm[i], 0.35 * gHi) * LEVEL_W[g.level] + rng() * 1e-3 });
   }
   cands.sort((a, b) => b.sc - a.sc);
-  let activeBeats = 0;
-  for (let i = 0; i < n; i += 4) if (an.rmsAt(G[i].t) >= an.silence) activeBeats++;
-  const target = Math.max(4, Math.round(Math.min(D.perBeat * activeBeats, D.perSec * activeBeats * an.beatDur)));
+  let activeBeats = 0, activeSec = 0;
+  for (let i = 0; i < an.beats.length - 1; i++) if (an.rmsAt(an.beats[i]) >= an.silence) { activeBeats++; activeSec += an.beats[i + 1] - an.beats[i]; }
+  const target = Math.max(4, Math.round(Math.min(D.perBeat * activeBeats, D.perSec * activeSec)));
+  // minimum spacing in beats; a triplet eighth (1/3) passes where a straight eighth (1/2) is allowed
+  const gapB = D.minGap / 4 * 0.65;
   const taken = new Uint8Array(n), picks = [];
   for (const c of cands) {
     if (picks.length >= target || c.sc < 0.1) break;
     let ok = true;
-    for (let k = Math.max(0, c.i - D.minGap + 1); k <= Math.min(n - 1, c.i + D.minGap - 1); k++) if (taken[k]) { ok = false; break; }
+    for (let k = c.i - 1; ok && k >= 0 && G[c.i].beat - G[k].beat < gapB; k--) if (taken[k]) ok = false;
+    for (let k = c.i + 1; ok && k < n && G[k].beat - G[c.i].beat < gapB; k++) if (taken[k]) ok = false;
     if (!ok) continue;
     taken[c.i] = 1; picks.push(c.i);
   }
   picks.sort((a, b) => a - b);
 
   // Turn picked rhythm points into taps, phrases (sliders) and spins
+  const onGrid = x => Math.abs(x * 4 - Math.round(x * 4)) < 0.02 || Math.abs(x * 3 - Math.round(x * 3)) < 0.02;
   const objs = []; let lastSpinEnd = -1e9;
   for (let k = 0; k < picks.length; k++) {
     const ia = picks[k], ib = picks[k + 1], ga = G[ia];
     const o = { type: 'tap', t: ga.t, beat: ga.beat };
     objs.push(o);
     if (ib === undefined) break;
-    const gapB = (ib - ia) / 4, sus = sustainInfo(an, ga.t, G[ib].t);
-    const s0 = ia + 4, s1 = ib - 4;
-    if (gapB >= (sus.sustained ? 4 : 6) && sus.loud && ga.t - lastSpinEnd > 14 && s1 - s0 >= 8) {
-      const sp = { type: 'spinner', t: G[s0].t, end: G[s1].t, beat: G[s0].beat };
+    const gb = G[ib], gap = gb.beat - ga.beat, sus = sustainInfo(an, ga.t, gb.t);
+    const sb0 = ga.beat + 1, sb1 = gb.beat - 1;
+    if (gap >= (sus.sustained ? 4 : 6) && sus.loud && ga.t - lastSpinEnd > 14 && sb1 - sb0 >= 2) {
+      const sp = { type: 'spinner', t: an.timeOfBeat(sb0), end: an.timeOfBeat(sb1), beat: sb0 };
       sp.req = Math.max(1, (sp.end - sp.t) * D.rps);
       objs.push(sp); lastSpinEnd = sp.end; continue;
     }
-    if (gapB >= D.sliderMin && (sus.sustained || (gapB >= 2 && rng() < 0.4) || rng() < D.sliderBias)) {
-      const len = ib - D.release - ia;
-      if (len >= 2) {
-        const opts = [1, 2, 3, 4].filter(m => len % m === 0 && len / m >= 2);
+    if (gap >= D.sliderMin && (sus.sustained || (gap >= 2 && rng() < 0.4) || rng() < D.sliderBias)) {
+      const endBeat = gb.beat - D.release / 4;
+      let j = ib - 1; while (j > ia && G[j].beat > endBeat + 1e-6) j--;
+      const lenB = G[j].beat - ga.beat;
+      if (j > ia && lenB >= 0.45) {
+        const opts = [1, 2, 3, 4].filter(m => lenB / m >= 0.45 && onGrid(lenB / m));
         let trav = 1;
         if (opts.length > 1 && rng() < 0.55) trav = opts[1 + Math.floor(rng() * (opts.length - 1))];
-        if (len / trav > 16) { const o2 = opts.filter(m => len / m <= 16); if (o2.length) trav = o2[0]; }
-        o.type = 'slider'; o.end = G[ia + len].t; o.trav = trav; o.spanBeats = len / 4 / trav;
+        if (lenB / trav > 4) { const o2 = opts.filter(m => lenB / m <= 4); if (o2.length) trav = o2[0]; }
+        o.type = 'slider'; o.end = G[j].t; o.trav = trav; o.spanBeats = lenB / trav;
       }
     }
   }
@@ -498,65 +634,111 @@ function generateMap(an, key, aspect) {
   return { objs, D, fw: layout.fw, fh: layout.fh, key };
 }
 
+function bezierPts(ax, ay, cx, cy, ex, ey, NP) {
+  const pts = [], cum = [0];
+  for (let i = 0; i <= NP; i++) {
+    const t = i / NP, u = 1 - t;
+    pts.push({ x: u * u * ax + 2 * u * t * cx + t * t * ex, y: u * u * ay + 2 * u * t * cy + t * t * ey });
+    if (i) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  }
+  return { pts, cum };
+}
+
 function layoutMap(objs, an, D, aspect, rng) {
   const fw = aspect >= 1 ? aspect : 1, fh = aspect >= 1 ? 1 : 1 / aspect;
-  const r = D.r, m = r * 1.15, bd = an.beatDur;
+  const r = D.r, m = r * 1.15, sep = r * 2.2, sep2 = sep * sep, maxD = Math.min(fw, fh) * 0.62;
   const inB = (x, y) => x >= m && x <= fw - m && y >= m && y <= fh - m;
+  // everything still on screen when a new marker appears: circles and sampled slider bodies
+  let shown = [];
+  const minD2 = (pts) => { let best = Infinity; for (const S of shown) for (const a of pts) for (const b of S.pts) { const d = (a.x - b.x) ** 2 + (a.y - b.y) ** 2; if (d < best) best = d; } return best; };
   let px = fw / 2, py = fh / 2, ang = rng() * TAU, prevEnd = null;
   for (const o of objs) {
-    if (o.type === 'spinner') { o.x = fw / 2; o.y = fh / 2; px = o.x; py = o.y; prevEnd = o.end; continue; }
+    if (o.type === 'spinner') { o.x = fw / 2; o.y = fh / 2; px = o.x; py = o.y; prevEnd = o.end; shown = []; continue; }
+    shown = shown.filter(S => S.until > o.t - D.ar);
     if (prevEnd === null) { o.x = fw / 2 + (rng() - 0.5) * fw * 0.3; o.y = fh / 2 + (rng() - 0.5) * fh * 0.3; }
     else {
-      const gb = Math.max(0.25, (o.t - prevEnd) / bd);
-      const dist = clamp(D.spacing * gb, r * 1.05, Math.min(fw, fh) * 0.62);
+      const gb = Math.max(0.25, (o.t - prevEnd) / an.beatLenAt(o.t));
+      const dist = clamp(D.spacing * gb, sep, maxD);
       ang += (rng() - 0.5) * 1.4;
       if (rng() < 0.18) ang += (rng() < 0.5 ? 1 : -1) * 2.0;
-      let placed = false;
-      for (let a = 0; a < 14; a++) {
-        const nx = px + Math.cos(ang) * dist, ny = py + Math.sin(ang) * dist;
-        if (inB(nx, ny)) { o.x = nx; o.y = ny; placed = true; break; }
-        ang += (a % 2 ? -1 : 1) * 0.45 * (a + 1);
+      let best = null, bestD = -1, found = false;
+      for (const dm of [1, 1.3, 1.7, 0.85]) {
+        const d = clamp(dist * dm, sep, maxD * 1.15);
+        for (let a = 0; a < 24 && !found; a++) {
+          const th = ang + (a % 2 ? -1 : 1) * Math.ceil(a / 2) * TAU / 24;
+          const nx = px + Math.cos(th) * d, ny = py + Math.sin(th) * d;
+          if (!inB(nx, ny)) continue;
+          const md = minD2([{ x: nx, y: ny }]);
+          if (md >= sep2) { o.x = nx; o.y = ny; ang = th; found = true; }
+          else if (md > bestD) { bestD = md; best = { x: nx, y: ny, th }; }
+        }
+        if (found) break;
       }
-      if (!placed) { ang = Math.atan2(fh / 2 - py, fw / 2 - px); o.x = clamp(px + Math.cos(ang) * dist, m, fw - m); o.y = clamp(py + Math.sin(ang) * dist, m, fh - m); }
+      // crowded spot: look anywhere on the field before accepting a near miss
+      for (let a = 0; a < 160 && !found; a++) {
+        const nx = m + rng() * (fw - 2 * m), ny = m + rng() * (fh - 2 * m);
+        if (Math.hypot(nx - px, ny - py) < sep) continue;
+        const md = minD2([{ x: nx, y: ny }]);
+        if (md >= sep2) { o.x = nx; o.y = ny; ang = Math.atan2(ny - py, nx - px); found = true; }
+        else if (md > bestD) { bestD = md; best = { x: nx, y: ny, th: Math.atan2(ny - py, nx - px) }; }
+      }
+      if (!found) {
+        if (best) { o.x = best.x; o.y = best.y; ang = best.th; }
+        else { ang = Math.atan2(fh / 2 - py, fw / 2 - px); o.x = clamp(px + Math.cos(ang) * dist, m, fw - m); o.y = clamp(py + Math.sin(ang) * dist, m, fh - m); }
+      }
     }
     px = o.x; py = o.y;
     if (o.type === 'slider') {
-      let L = clamp(D.sv * o.spanBeats, r * 2.4, Math.min(fw, fh) * 0.6);
-      let dir = ang + (rng() - 0.5) * 1.6, ex = px, ey = py, ok = false;
-      for (let a = 0; a < 24 && !ok; a++) {
-        ex = px + Math.cos(dir) * L; ey = py + Math.sin(dir) * L;
-        if (inB(ex, ey)) ok = true; else { dir += (a % 2 ? -1 : 1) * 0.4 * (a + 1); if (a === 11) L *= 0.7; }
+      const L0 = clamp(D.sv * o.spanBeats, r * 2.4, Math.min(fw, fh) * 0.6);
+      const bendF = (rng() - 0.5) * 0.9, dir0 = ang + (rng() - 0.5) * 1.6;
+      let pick = null, pickD = -1;
+      for (const lm of [1, 0.75, 0.55]) {
+        const L = Math.max(r * 2.4, L0 * lm);
+        for (let a = 0; a < 24; a++) {
+          const dir = dir0 + (a % 2 ? -1 : 1) * Math.ceil(a / 2) * TAU / 24;
+          const ex = px + Math.cos(dir) * L, ey = py + Math.sin(dir) * L;
+          if (!inB(ex, ey)) continue;
+          const bend = bendF * L;
+          const cx = clamp((px + ex) / 2 - Math.sin(dir) * bend, m, fw - m), cy = clamp((py + ey) / 2 + Math.cos(dir) * bend, m, fh - m);
+          const geo = bezierPts(px, py, cx, cy, ex, ey, 40);
+          const md = minD2(geo.pts.filter((p, i) => i % 3 === 0 || i === 40));
+          if (md >= sep2) { pick = { geo, dir }; pickD = Infinity; break; }
+          if (md > pickD) { pickD = md; pick = { geo, dir }; }
+        }
+        if (pickD === Infinity) break;
       }
-      if (!ok) { dir = Math.atan2(fh / 2 - py, fw / 2 - px); ex = clamp(px + Math.cos(dir) * L * 0.6, m, fw - m); ey = clamp(py + Math.sin(dir) * L * 0.6, m, fh - m); }
-      const bend = (rng() - 0.5) * 0.9 * L;
-      const cx = clamp((px + ex) / 2 - Math.sin(dir) * bend, m, fw - m), cy = clamp((py + ey) / 2 + Math.cos(dir) * bend, m, fh - m);
-      const NP = 40, pts = [], cum = [0];
-      for (let i = 0; i <= NP; i++) {
-        const t = i / NP, u = 1 - t;
-        pts.push({ x: u * u * px + 2 * u * t * cx + t * t * ex, y: u * u * py + 2 * u * t * cy + t * t * ey });
-        if (i) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+      if (pickD !== Infinity) {
+        // no clear path for the phrase body: keep it as a plain tap instead of overlapping
+        o.type = 'tap'; delete o.end; delete o.trav; delete o.spanBeats;
+        prevEnd = o.t; shown.push({ pts: [{ x: o.x, y: o.y }], until: o.t + 0.3 });
+        continue;
       }
+      const { pts, cum } = pick.geo, NP = 40;
       o.pts = pts; o.cum = cum; o.len = cum[NP] || 1e-6;
       o.span = (o.end - o.t) / o.trav;
+      // ticks on each beat inside the phrase, at every turn, and at the end
       const ticks = [];
-      for (let k = 1; o.t + k * bd < o.end - 0.06; k++) ticks.push(o.t + k * bd);
+      for (const b of an.beats) if (b > o.t + 0.06 && b < o.end - 0.06) ticks.push(b);
       for (let k = 1; k < o.trav; k++) ticks.push(o.t + k * o.span);
       ticks.push(Math.max(o.t + 0.02, o.end - 0.036));
       ticks.sort((a, b) => a - b);
       o.ticks = ticks.filter((t, i) => i === 0 || t - ticks[i - 1] > 0.06);
       const fin = o.trav % 2 ? pts[NP] : pts[0];
       px = fin.x; py = fin.y;
-      const ed = Math.atan2(pts[NP].y - pts[NP - 1].y, pts[NP].x - pts[NP - 1].x);
-      ang = o.trav % 2 ? ed : Math.atan2(pts[0].y - pts[1].y, pts[0].x - pts[1].x);
+      ang = o.trav % 2 ? Math.atan2(pts[NP].y - pts[NP - 1].y, pts[NP].x - pts[NP - 1].x) : Math.atan2(pts[0].y - pts[1].y, pts[0].x - pts[1].x);
       prevEnd = o.end;
-    } else prevEnd = o.t;
+      shown.push({ pts: pts.filter((p, i) => i % 3 === 0 || i === NP), until: o.end + 0.3 });
+    } else {
+      prevEnd = o.t;
+      shown.push({ pts: [{ x: o.x, y: o.y }], until: o.t + 0.3 });
+    }
   }
   // combos: a new number sequence each bar (two on Easy), after spins, or after 8 notes
   let num = 0, bar0 = -99, col = -1;
   const barsPer = D.key === 'easy' ? 2 : 1;
   for (const o of objs) {
     if (o.type === 'spinner') { num = 0; continue; }
-    const bar = Math.floor((o.beat - an.downPhase) / 4);
+    const bar = an.barIdx[clamp(Math.floor(o.beat + 1e-6), 0, an.barIdx.length - 1)];
     if (num === 0 || num >= 8 || (bar - bar0 >= barsPer && num >= 3)) { col = (col + 1) % 4; num = 0; bar0 = bar; }
     num++; o.num = num; o.col = col;
   }
@@ -707,11 +889,12 @@ async function loadBuffer(name, buffer, isDemo) {
   $('#trackName').textContent = name;
   $('#trackTag').textContent = isDemo ? 'Demo' : 'Your song';
   $('#trackTag').classList.toggle('demo', isDemo);
-  $('#stBpm').innerHTML = Math.round(current.bpm) + ' <small>bpm</small>';
+  const lo = Math.round(current.bpmLo), hi = Math.round(current.bpmHi);
+  $('#stBpm').innerHTML = (hi / lo > 1.06 ? lo + '–' + hi : Math.round(current.bpm)) + ' <small>bpm</small>';
   const d = Math.round(current.duration);
   $('#stLen').textContent = Math.floor(d / 60) + ':' + String(d % 60).padStart(2, '0');
   $('#stOn').textContent = current.onsets.length;
-  $('#stBeats').textContent = current.beats.length;
+  $('#stMeter').innerHTML = current.meterList.slice(0, 3).map(m => m + '/4').join(' ') + (current.swingShare > 0.35 ? ' <small>swing</small>' : '');
   $('#play').disabled = $('#listen').disabled = false;
   refreshMap();
 }
@@ -779,13 +962,23 @@ function drawDetail(playhead) {
   c.clearRect(0, 0, w, h);
   const top = 18, envBot = h * 0.55, laneY = h * 0.78;
   // beat grid
+  const meterAt = new Map(an.meters.map(m => [m.beat, m.m]));
   an.beats.forEach((b, i) => {
     if (b < t0 - 0.1 || b > t1 + 0.1) return;
-    const down = ((i - an.downPhase) % 4 + 4) % 4 === 0, x = Math.round(X(b)) + 0.5;
+    const down = an.barPos[i] === 0, x = Math.round(X(b)) + 0.5;
     c.strokeStyle = down ? 'rgba(255,255,255,0.42)' : 'rgba(255,255,255,0.13)'; c.lineWidth = 1;
     c.beginPath(); c.moveTo(x, down ? 4 : top); c.lineTo(x, h - 4); c.stroke();
-    if (down) { c.fillStyle = 'rgba(255,255,255,0.55)'; c.font = `500 10px ${MONO}`; c.textAlign = 'left'; c.textBaseline = 'top'; c.fillText(String(Math.floor((i - an.downPhase) / 4) + 1), x + 3, 4); }
+    c.font = `500 10px ${MONO}`; c.textAlign = 'left'; c.textBaseline = 'top';
+    let lx = x + 3;
+    if (down) { c.fillStyle = 'rgba(255,255,255,0.55)'; const lb = String(an.barIdx[i] + 1); c.fillText(lb, lx, 4); lx += c.measureText(lb).width + 6; }
+    if (meterAt.has(i) && an.meters.length > 1) { c.fillStyle = COLORS[1]; c.fillText(meterAt.get(i) + '/4', lx, 4); }
   });
+  // subdivision ticks: sixteenths in white, triplet grid in mint
+  for (const g of an.grid) {
+    if (g.t < t0 || g.t > t1 || g.level < 2) continue;
+    c.fillStyle = g.tri ? COLORS[3] : 'rgba(255,255,255,0.35)';
+    c.fillRect(Math.round(X(g.t)) - 0.5, envBot + 2, 1.5, g.tri || g.level === 2 ? 7 : 4);
+  }
   // onset novelty
   const f0 = an.frameOf(t0), f1 = an.frameOf(t1), sc = (envBot - top);
   c.beginPath(); c.moveTo(X(an.off + f0 * an.hopT), envBot);
@@ -1133,13 +1326,14 @@ function drawBackdrop(c, now, perf) {
     c.beginPath(); c.moveTo(cx, cy); c.arc(cx, cy, R, a0, a1); c.closePath(); c.fill();
   }
   // beat rings from the tracked beat grid
-  const B = current.beats, bd = current.beatDur;
+  const B = current.beats;
   while (G.beatI < B.length - 1 && B[G.beatI + 1] <= now) G.beatI++;
   while (G.beatI > 0 && B[G.beatI] > now) G.beatI--;
   for (let k = G.beatI - 1; k <= G.beatI; k++) {
     if (k < 0 || B[k] > now) continue;
+    const bd = B[Math.min(k + 1, B.length - 1)] - B[k] || current.beatDur;
     const p = (now - B[k]) / (bd * 1.6); if (p > 1) continue;
-    const down = ((k - current.downPhase) % 4 + 4) % 4 === 0;
+    const down = current.barPos[k] === 0;
     c.globalAlpha = (down ? 0.3 : 0.16) * (1 - p); c.strokeStyle = down ? COLORS[1] : '#ffffff'; c.lineWidth = down ? 6 : 3;
     c.beginPath(); c.arc(cx, cy, Math.min(VW, VH) * (0.08 + 0.75 * p), 0, TAU); c.stroke();
   }
