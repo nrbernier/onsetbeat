@@ -76,6 +76,7 @@ input[type=range]{width:100%;accent-color:var(--gold)}
 .crop-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
 .crop-head output{font-family:var(--mono);font-size:14px;font-variant-numeric:tabular-nums}
 .crop-lab{display:block;font-size:13.5px;color:var(--muted);margin-bottom:2px}
+#bgSel{grid-template-columns:2fr 1fr 1fr}
 .diffs button:disabled{opacity:.35;cursor:default}
 .actions{display:grid;grid-template-columns:2fr 1fr;gap:10px}
 .btn{font-family:var(--display);font-size:20px;border-radius:14px;padding:14px 16px;border:0;cursor:pointer;color:#1a1530;background:var(--gold)}
@@ -214,6 +215,15 @@ input[type=range]{width:100%;accent-color:var(--gold)}
   <section class="section">
     <h2>Settings</h2>
     <div class="opts">
+      <div class="offset">
+        <div class="offset-row"><b id="bgLab">Background</b></div>
+        <div class="diffs" role="radiogroup" aria-labelledby="bgLab" id="bgSel">
+          <button role="radio" data-bg="wave" aria-checked="true">Wave and stars</button>
+          <button role="radio" data-bg="rays" aria-checked="false">Rays</button>
+          <button role="radio" data-bg="off" aria-checked="false">Plain</button>
+        </div>
+        <p class="note">Wave and stars: the song scrolls in from the right across a band at the top, with upcoming markers marked under it, and a dim starfield behind the markers.</p>
+      </div>
       <div class="opt"><label for="optSounds">Hit sounds<span class="hint">A clap on every good hit</span></label><input type="checkbox" class="switch" id="optSounds"></div>
       <div class="opt"><label for="optNofail">No fail<span class="hint">Keep playing when the life bar empties</span></label><input type="checkbox" class="switch" id="optNofail"></div>
       <div class="offset">
@@ -804,7 +814,7 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('onsetbeat:' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem('onsetbeat:' + k, JSON.stringify(v)); } catch (e) {} }
 };
-const settings = { cropLen: store.get('cropLen', 0), diff: store.get('diff', 'normal'), sounds: store.get('sounds', true), nofail: store.get('nofail', false), offset: store.get('offset', 0) };
+const settings = { bg: store.get('bg', 'wave'), cropLen: store.get('cropLen', 0), diff: store.get('diff', 'normal'), sounds: store.get('sounds', true), nofail: store.get('nofail', false), offset: store.get('offset', 0) };
 if (!DIFFS[settings.diff]) settings.diff = 'normal';
 
 let actx = null, noiseBuf = null;
@@ -1201,6 +1211,9 @@ optS.checked = settings.sounds; optN.checked = settings.nofail; optO.value = set
 const showOff = () => { $('#offOut').textContent = (settings.offset > 0 ? '+' : '') + settings.offset + ' ms'; };
 showOff();
 optS.addEventListener('change', () => { settings.sounds = optS.checked; store.set('sounds', settings.sounds); });
+const syncBg = () => document.querySelectorAll('#bgSel button').forEach(b => b.setAttribute('aria-checked', String(b.dataset.bg === settings.bg)));
+syncBg();
+$('#bgSel').addEventListener('click', e => { const b = e.target.closest('button[data-bg]'); if (!b) return; settings.bg = b.dataset.bg; store.set('bg', settings.bg); syncBg(); });
 optN.addEventListener('change', () => { settings.nofail = optN.checked; store.set('nofail', settings.nofail); });
 optO.addEventListener('input', () => { settings.offset = +optO.value; store.set('offset', settings.offset); showOff(); });
 
@@ -1266,7 +1279,9 @@ function resizeGame() {
   stage.width = Math.round(VW * dpr); stage.height = Math.round(VH * dpr);
   const cs = getComputedStyle($('#probe'));
   safe = { t: parseFloat(cs.paddingTop) || 0, r: parseFloat(cs.paddingRight) || 0, b: parseFloat(cs.paddingBottom) || 0, l: parseFloat(cs.paddingLeft) || 0 };
-  const x0 = safe.l + 12, x1 = VW - safe.r - 12, y0 = safe.t + 66, y1 = VH - safe.b - 54;
+  const wave = settings.bg === 'wave';
+  G.band = wave ? { x: safe.l + 12, y: safe.t + 58, w: VW - safe.l - safe.r - 24, h: 52 } : null;
+  const x0 = safe.l + 12, x1 = VW - safe.r - 12, y0 = wave ? G.band.y + G.band.h + 12 : safe.t + 66, y1 = VH - safe.b - 54;
   PF = { x0, y0, w: Math.max(50, x1 - x0), h: Math.max(50, y1 - y0) };
   if (G.map) placeField();
 }
@@ -1490,7 +1505,7 @@ function finish(failed) {
 function frame(perf) {
   G.loop = requestAnimationFrame(frame);
   if ($('#game').hidden || !G.map) return;
-  const dt = Math.min(0.05, (perf - G.lastPerf) / 1000); G.lastPerf = perf;
+  const dt = Math.min(0.05, (perf - G.lastPerf) / 1000); G.lastPerf = perf; G.starDt = dt;
   if (G.media) clockTick(G.media, perf);
   const now = actx ? songNow(perf) : 0;
   if (G.media && G.running && !G.paused && !G.ended && G.cropE < current.duration - 0.01) {
@@ -1527,6 +1542,8 @@ function draw(now, perf) {
   drawHud(c, now, perf);
 }
 function drawBackdrop(c, now, perf) {
+  if (settings.bg === 'wave') return drawWaveBackdrop(c, now, perf);
+  if (settings.bg === 'off') return;
   const cx = VW / 2, cy = VH / 2, R = Math.hypot(VW, VH) * 0.6, n = 24;
   let bass = 0;
   if (G.analyser && G.running && !G.paused) G.analyser.getByteFrequencyData(G.freq);
@@ -1554,6 +1571,65 @@ function drawBackdrop(c, now, perf) {
   const g = c.createRadialGradient(cx, cy, 0, cx, cy, Math.min(VW, VH) * (0.2 + 0.4 * bass));
   g.addColorStop(0, 'rgba(255,201,74,' + (0.05 + 0.2 * bass * bass).toFixed(3) + ')'); g.addColorStop(1, 'rgba(255,201,74,0)');
   c.globalAlpha = 1; c.fillStyle = g; c.fillRect(0, 0, VW, VH);
+}
+// loudness at 50 values per second, normalised, built once per song for the scrolling band
+function waveOf(an) {
+  if (an.wave) return an.wave;
+  const n = Math.ceil(an.duration * 50), w = new Float32Array(n), norm = 1 / (an.rmsP90 * 1.15);
+  for (let i = 0; i < n; i++) {
+    const f0 = an.frameOf(i / 50), f1 = an.frameOf((i + 1) / 50); let m = 0;
+    for (let f = f0; f <= f1; f++) if (an.rms[f] > m) m = an.rms[f];
+    w[i] = Math.min(1, m * norm);
+  }
+  return (an.wave = w);
+}
+function drawWaveBackdrop(c, now, perf) {
+  const an = current, Bd = G.band;
+  let bass = 0;
+  if (G.analyser && G.running && !G.paused) G.analyser.getByteFrequencyData(G.freq);
+  const F = G.freq || []; for (let i = 0; i < 4; i++) bass += (F[i] || 0) / 255; bass /= 4;
+  // starfield behind the markers: drifts at a speed set by the local tempo, nudged by the bass
+  if (!G.stars) G.stars = Array.from({ length: 80 }, () => ({ a: Math.random() * TAU, d: Math.random() }));
+  const dt = G.starDt || 0, tempo = 60 / an.beatLenAt(Math.max(0, now));
+  const sp = (0.1 + 0.22 * bass * bass) * tempo / 120, cx = PF.cx, cy = PF.cy, R = Math.hypot(VW, VH) * 0.55;
+  c.save(); c.beginPath(); c.rect(0, PF.y0 - 4, VW, VH - PF.y0 + 4); c.clip();
+  c.fillStyle = '#cfd0ff';
+  for (const st of G.stars) {
+    if (!G.paused) st.d += dt * sp * (0.3 + st.d);
+    if (st.d > 1.15) { st.d = 0.03; st.a = Math.random() * TAU; }
+    const rr = st.d * R, z = 1 + st.d * 1.6;
+    c.globalAlpha = Math.min(0.45, st.d * 0.7);
+    c.fillRect(cx + Math.cos(st.a) * rr, cy + Math.sin(st.a) * rr, z, z);
+  }
+  c.restore();
+  // waveform band: future enters on the right and scrolls left past the "now" line
+  const span = 6, nowX = Bd.x + Bd.w * 0.25, mid = Bd.y + Bd.h / 2;
+  const T = px => now + (px - nowX) / Bd.w * span, X = t => nowX + (t - now) / span * Bd.w;
+  const wv = waveOf(an), step = 2, colDt = span / Bd.w * step;
+  c.globalAlpha = 1; c.fillStyle = 'rgba(255,255,255,0.04)';
+  c.beginPath(); c.roundRect ? c.roundRect(Bd.x, Bd.y, Bd.w, Bd.h, 8) : c.rect(Bd.x, Bd.y, Bd.w, Bd.h); c.fill();
+  for (let px = Bd.x; px < Bd.x + Bd.w; px += step) {
+    const t0 = T(px); if (t0 < 0 || t0 > an.duration) continue;
+    let m = 0; for (let i = Math.floor(t0 * 50), e = Math.ceil((t0 + colDt) * 50); i <= e && i < wv.length; i++) if (wv[i] > m) m = wv[i];
+    const out = t0 < G.cropS || t0 > G.cropE, h = Math.max(1, m * Bd.h * 0.42);
+    c.fillStyle = out ? 'rgba(171,166,212,0.12)' : px < nowX ? 'rgba(76,198,255,0.6)' : 'rgba(171,166,212,0.38)';
+    c.fillRect(px, mid - h, step, h * 2);
+  }
+  // bar starts
+  c.fillStyle = 'rgba(255,255,255,0.16)';
+  const B = an.beats;
+  for (let i = an.beatIdxAt(Math.max(0, T(Bd.x))); i < B.length && B[i] <= T(Bd.x + Bd.w); i++) if (an.barPos[i] === 0 && B[i] >= T(Bd.x)) c.fillRect(Math.round(X(B[i])), Bd.y + 3, 1, Bd.h - 6);
+  // upcoming markers along the bottom edge
+  const tL = T(Bd.x), tR = T(Bd.x + Bd.w), yb = Bd.y + Bd.h - 7;
+  for (let i = Math.max(0, G.first - 8); i < G.objs.length; i++) {
+    const o = G.objs[i]; if (o.t > tR) break; if ((o.end || o.t) < tL) continue;
+    const a = o.t < now ? 0.3 : 1, x0 = Math.max(Bd.x, X(o.t)), x1 = Math.min(Bd.x + Bd.w, X(o.end || o.t));
+    c.globalAlpha = a;
+    if (o.type === 'spinner') { c.fillStyle = COLORS[0]; c.fillRect(x0, yb - 2, Math.max(3, x1 - x0), 6); }
+    else if (o.type === 'slider') { c.fillStyle = COLORS[2]; c.fillRect(x0, yb, Math.max(3, x1 - x0), 4); c.fillStyle = COLORS[1]; c.fillRect(x0 - 1, yb - 3, 3, 7); }
+    else { c.fillStyle = COLORS[1]; c.fillRect(x0 - 1, yb - 3, 3, 7); }
+  }
+  c.globalAlpha = 1; c.fillStyle = '#fff'; c.fillRect(Math.round(nowX) - 1, Bd.y - 3, 2, Bd.h + 6);
 }
 function circleBody(c, x, y, r, col, num) {
   c.beginPath(); c.arc(x, y, r, 0, TAU); c.fillStyle = COLORS[col]; c.fill();
@@ -1668,7 +1744,7 @@ function drawHud(c, now, perf) {
   c.globalAlpha = 1;
   if (now < (G.objs[0]?.t ?? 0) - 0.4 && !G.ended) {
     c.textAlign = 'center'; c.textBaseline = 'middle'; c.font = `${Math.round(Math.min(VW, VH) * 0.07)}px ${DISPLAY}`; c.fillStyle = '#fff';
-    c.globalAlpha = 0.9; c.fillText(G.D.label.toUpperCase(), VW / 2, safe.t + 90); c.globalAlpha = 1;
+    c.globalAlpha = 0.9; c.fillText(G.D.label.toUpperCase(), VW / 2, PF.y0 + 36); c.globalAlpha = 1;
   }
 }
 
