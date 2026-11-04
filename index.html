@@ -551,10 +551,10 @@ function analyzeAudio(x, sr, report) {
 
 /* ---------- Chart generation ---------- */
 const DIFFS = {
-  easy:   { key: 'easy',   label: 'Easy',   maxLevel: 1, minGap: 4, perBeat: 0.5,  perSec: 1.2, r: 0.095, ar: 1.4,  spacing: 0.30, sv: 0.22, sliderMin: 2,   sliderBias: 0.10, release: 4, rps: 0.9, drain: 0.012, miss: 0.08, win: [0.065, 0.12, 0.18] },
-  normal: { key: 'normal', label: 'Normal', maxLevel: 2, minGap: 2, perBeat: 0.8,  perSec: 2.1, r: 0.082, ar: 1.15, spacing: 0.32, sv: 0.26, sliderMin: 1,   sliderBias: 0.12, release: 2, rps: 1.2, drain: 0.02,  miss: 0.10, win: [0.055, 0.105, 0.155] },
-  hard:   { key: 'hard',   label: 'Hard',   maxLevel: 3, minGap: 2, perBeat: 1.1,  perSec: 3.0, r: 0.072, ar: 0.9,  spacing: 0.36, sv: 0.32, sliderMin: 1,   sliderBias: 0.14, release: 2, rps: 1.5, drain: 0.03,  miss: 0.12, win: [0.048, 0.095, 0.14] },
-  insane: { key: 'insane', label: 'Insane', maxLevel: 3, minGap: 1, perBeat: 1.55, perSec: 4.4, r: 0.064, ar: 0.72, spacing: 0.40, sv: 0.36, sliderMin: 0.5, sliderBias: 0.16, release: 1, rps: 1.8, drain: 0.04,  miss: 0.14, win: [0.042, 0.085, 0.125] },
+  easy:   { key: 'easy', vel: 0.44,   label: 'Easy',   maxLevel: 1, minGap: 4, perBeat: 0.5,  perSec: 1.2, r: 0.095, ar: 1.4,  spacing: 0.30, sv: 0.22, sliderMin: 2,   sliderBias: 0.10, release: 4, rps: 0.9, drain: 0.012, miss: 0.08, win: [0.065, 0.12, 0.18] },
+  normal: { key: 'normal', vel: 0.52, label: 'Normal', maxLevel: 2, minGap: 2, perBeat: 0.8,  perSec: 2.1, r: 0.082, ar: 1.15, spacing: 0.32, sv: 0.26, sliderMin: 1,   sliderBias: 0.12, release: 2, rps: 1.2, drain: 0.02,  miss: 0.10, win: [0.055, 0.105, 0.155] },
+  hard:   { key: 'hard', vel: 0.62,   label: 'Hard',   maxLevel: 3, minGap: 2, perBeat: 1.1,  perSec: 3.0, r: 0.072, ar: 0.9,  spacing: 0.36, sv: 0.32, sliderMin: 1,   sliderBias: 0.14, release: 2, rps: 1.5, drain: 0.03,  miss: 0.12, win: [0.048, 0.095, 0.14] },
+  insane: { key: 'insane', vel: 0.70, label: 'Insane', maxLevel: 3, minGap: 1, perBeat: 1.55, perSec: 4.4, r: 0.064, ar: 0.72, spacing: 0.40, sv: 0.36, sliderMin: 0.5, sliderBias: 0.16, release: 1, rps: 1.8, drain: 0.04,  miss: 0.14, win: [0.042, 0.085, 0.125] },
 };
 const LEVEL_W = [1.3, 1.1, 0.85, 0.6]; // downbeat, beat, eighth, sixteenth
 
@@ -617,6 +617,7 @@ function sustainInfo(an, ta, tb) {
 
 function generateMap(an, key, aspect) {
   const D = DIFFS[key], G = an.grid, n = G.length;
+  const LMIN = D.r * 2.4, LMAX = Math.min(aspect >= 1 ? aspect : 1, aspect >= 1 ? 1 : 1 / aspect) * 0.6; // track length limits, as in layoutMap
   const rng = mulberry32(hashStr(an.name + '|' + key + '|' + an.duration.toFixed(2)));
   // strength relative to the loudest onset within ±8 beats, so quiet sections still get notes
   const lm = new Float32Array(n);
@@ -682,11 +683,18 @@ function generateMap(an, key, aspect) {
       let j = ib - 1; while (j > ia && G[j].beat > endBeat + 1e-6) j--;
       const lenB = G[j].beat - ga.beat;
       if (j > ia && lenB >= 0.45) {
-        const opts = [1, 2, 3, 4].filter(m => lenB / m >= 0.45 && onGrid(lenB / m));
-        let trav = 1;
-        if (opts.length > 1 && rng() < 0.55) trav = opts[1 + Math.floor(rng() * (opts.length - 1))];
-        if (lenB / trav > 4) { const o2 = opts.filter(m => lenB / m <= 4); if (o2.length) trav = o2[0]; }
-        o.type = 'slider'; o.end = G[j].t; o.trav = trav; o.spanBeats = lenB / trav;
+        // The ball should move at about the same on-screen speed in every phrase. A pass is only
+        // allowed if its track can be drawn at 75–135% of the difficulty's speed: too short a pass
+        // would have to be a tiny, frantic swing, too long a pass a crawl. Turns need a full beat
+        // and 0.45 s per pass, so back-and-forth phrases stay readable.
+        const sec = G[j].t - ga.t;
+        const ok = m => { const ps = sec / m, sp = clamp(D.vel * ps, LMIN, LMAX) / ps; return sp >= 0.75 * D.vel && sp <= 1.35 * D.vel && (m === 1 || (lenB / m >= 1 && ps >= 0.45)); };
+        const opts = [1, 2, 3, 4].filter(m => onGrid(lenB / m) && ok(m));
+        if (opts.length) {
+          let trav = opts[0];
+          if (opts.length > 1 && (rng() < 0.55 || !opts.includes(1))) trav = opts[1 + Math.floor(rng() * (opts.length - 1))];
+          o.type = 'slider'; o.end = G[j].t; o.trav = trav; o.spanBeats = lenB / trav;
+        }
       }
     }
   }
@@ -749,10 +757,10 @@ function layoutMap(objs, an, D, aspect, rng) {
     }
     px = o.x; py = o.y;
     if (o.type === 'slider') {
-      const L0 = clamp(D.sv * o.spanBeats, r * 2.4, Math.min(fw, fh) * 0.6);
+      const L0 = clamp(D.vel * (o.end - o.t) / o.trav, r * 2.4, Math.min(fw, fh) * 0.6);
       const bendF = (rng() - 0.5) * 0.9, dir0 = ang + (rng() - 0.5) * 1.6;
       let pick = null, pickD = -1;
-      for (const lm of [1, 0.75, 0.55]) {
+      for (const lm of [1, 0.88]) { // never shrink enough to change the ball's speed noticeably
         const L = Math.max(r * 2.4, L0 * lm);
         for (let a = 0; a < 24; a++) {
           const dir = dir0 + (a % 2 ? -1 : 1) * Math.ceil(a / 2) * TAU / 24;

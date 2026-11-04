@@ -99,6 +99,8 @@ Each picked note then becomes a marker, depending on what happens until the next
 
 - **Spin**: a gap of at least 6 beats, or 4 if the sound is held, while the music stays loud. At most one spin every 14 s. The spin runs from one beat after the note to one beat before the next.
 - **Phrase** (slider): the sound after the note stays at least half as loud as its attack, with little new onset activity. Some longer gaps also become phrases at random, for variety. A phrase ends a short release before the next note. When its length divides evenly on the grid, it may turn back 1–3 times.
+
+  **Phrase speed is kept nearly constant**, so the ball's movement can be anticipated. Each difficulty has one target speed (0.44 / 0.52 / 0.62 / 0.70 screen widths per second, Easy to Insane), and the track length is set from the pass's duration in seconds, not in beats. A number of passes is only allowed if the track can be drawn at 75–135% of that speed; turns also need at least a beat and 0.45 s per pass. If nothing fits (a very short phrase would need a tiny, frantic swing), the note stays a tap. On *Breach* this brought the fastest/slowest phrase ratio on Normal from 11.5× to 1.6×, and the shortest back-and-forth pass from 0.21 s to 0.63 s.
 - **Tap**: everything else.
 
 ![Chart generation for four difficulties](img/6-chart-difficulties.svg)
