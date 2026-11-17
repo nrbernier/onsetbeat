@@ -1434,7 +1434,7 @@ async function startGame() {
   G.map = cropMap(generateMap(current, settings.diff, PF.w / PF.h), current, cs, ce); placeField();
   const D = G.map.D;
   Object.assign(G, { running: true, paused: false, ended: false, objs: G.map.objs, D, score: 0, combo: 0, maxCombo: 0,
-    counts: { 300: 0, 100: 0, 50: 0, 0: 0 }, health: 1, pops: [], errs: [], first: 0, spin: null, lastPerf: performance.now(), beatI: 0, failed: false });
+    counts: { 300: 0, 100: 0, 50: 0, 0: 0 }, health: 1, pops: [], errs: [], first: 0, spin: null, lastPerf: performance.now(), beatI: 0, failed: false, resumeTo: -1e9 });
   for (const o of G.objs) { o.done = false; o.res = null; o.headDone = false; o.headHit = false; o.tickI = 0; o.tickHit = 0; o.following = false; o.acc = 0; o.net = 0; o.vis = 0; o.bonus = 0; o.doneAt = 0; o.shake = 0; }
   G.lastEnd = G.objs.length ? Math.max(...G.objs.map(o => o.end || o.t)) : ce;
   const firstT = G.objs.length ? G.objs[0].t : cs;
@@ -1479,13 +1479,23 @@ function quitGame() {
   if (G.loop) { cancelAnimationFrame(G.loop); G.loop = 0; } // no drawing while the song page is shown
   drawAnalysis();
 }
+// Resuming replays the last couple of seconds with a count-down, so the player can pick up the beat
+// again before the first new marker. Markers already judged stay judged; no life drains meanwhile.
+const REWIND = 2;
 function pauseGame() {
   if (!G.running || G.paused || G.ended) return;
-  G.paused = true; if (G.media) G.media.pause(); actx.suspend().catch(() => {}); $('#pauseMenu').hidden = false;
+  const now = songNow(performance.now());
+  G.paused = true; G.resumeTo = Math.max(G.resumeTo, now);
+  if (G.media) G.media.pause(); actx.suspend().catch(() => {}); $('#pauseMenu').hidden = false;
 }
 function resumeGame() {
   G.paused = false; $('#pauseMenu').hidden = true; actx.resume().catch(() => {}); G.lastPerf = performance.now();
-  if (G.media) { clockReset(); const p = G.media.play(); if (p && p.catch) p.catch(() => {}); }
+  if (G.media) {
+    // restart the element a little earlier; the delay line is reset and stays muted until playback begins
+    const from = clamp(G.resumeTo - REWIND, G.cropS, current.duration);
+    G.mdelay = 0.25; G.fading = false; G.beatI = 0;
+    playMedia(current, from, G.mdelay);
+  }
 }
 $('#play').addEventListener('click', startGame);
 $('#pauseBtn').addEventListener('click', pauseGame);
@@ -1586,7 +1596,7 @@ function update(now, dtSec) {
   while (G.first < objs.length && objs[G.first].done) G.first++;
   // life drains while markers are on screen, never during breaks or spins
   const next = objs[G.first];
-  if (next && !G.spin && now > objs[0].t - 0.5 && next.t - now < 2.5) G.health -= D.drain * dtSec;
+  if (next && !G.spin && now > objs[0].t - 0.5 && now > G.resumeTo && next.t - now < 2.5) G.health -= D.drain * dtSec;
   if (G.health <= 0) { G.health = 0; if (!settings.nofail) return finish(true); }
   if ((G.first >= objs.length && now > Math.min(G.lastEnd + 1.2, G.cropE + 0.3)) || now > G.cropE + 0.5) finish(false);
 }
@@ -1628,7 +1638,7 @@ function frame(perf) {
   if (G.media) clockTick(G.media, perf);
   const now = actx ? songNow(perf) : 0;
   if (G.media && G.running && !G.paused && !G.ended && G.cropE < current.duration - 0.01) {
-    if (!G.fading && now >= G.cropE - 1.5) {
+    if (!G.fading && now >= Math.max(G.cropE - 1.5, G.resumeTo - REWIND + 0.1)) { // after a resume, wait until the sound has opened again
       G.fading = true; const g = G.gain, t = actx.currentTime;
       g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(0.0001, t + Math.max(0.05, G.cropE - now));
     }
@@ -1861,6 +1871,15 @@ function drawHud(c, now, perf) {
     c.fillRect(mx + clamp(e.dt / w50, -1, 1) * mw / 2 - 1, my - 7, 2, 14);
   }
   c.globalAlpha = 1;
+  // count-down while the last seconds replay after a pause
+  if (now < G.resumeTo && !G.ended && !G.paused) {
+    const left = G.resumeTo - now, n = Math.ceil(left), k = n - left;
+    c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillStyle = '#fff';
+    c.globalAlpha = 0.85 * (1 - k * 0.6); c.font = `${Math.round(Math.min(VW, VH) * (0.16 + 0.04 * (1 - k)))}px ${DISPLAY}`;
+    c.fillText(n, VW / 2, PF.y0 + 70);
+    c.globalAlpha = 0.7; c.font = `700 14px ${MONO}`; c.fillText('GET READY', VW / 2, PF.y0 + 70 + Math.min(VW, VH) * 0.13);
+    c.globalAlpha = 1;
+  }
   if (now < (G.objs[0]?.t ?? 0) - 0.4 && !G.ended) {
     c.textAlign = 'center'; c.textBaseline = 'middle'; c.font = `${Math.round(Math.min(VW, VH) * 0.07)}px ${DISPLAY}`; c.fillStyle = '#fff';
     c.globalAlpha = 0.9; c.fillText(G.D.label.toUpperCase(), VW / 2, PF.y0 + 36); c.globalAlpha = 1;
