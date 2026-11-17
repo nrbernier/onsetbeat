@@ -80,6 +80,15 @@ On the test tracks this detects 3/4, 4/4, 5/4 and 7/4 correctly, and finds both 
 
 **Known limit:** in 5/4 with kicks on both 1 and 4, the bar start is ambiguous and sometimes lands on 4. Uneven meters like 9/8 (2+2+2+3) are not detected. The beats there are evenly spaced, so the bar lines are only approximate.
 
+### Fixing the beat by hand
+
+When the analysis is off, the song card has a **Beat fix** row under the close-up:
+
+- **×2** adds a beat halfway between every pair; **÷2** keeps every other beat, on the side with more kick energy (and more of the detected bar starts). After either, the song gets one meter (the most common one) and its bar start is placed on the strongest kicks again.
+- **◀ Bar / Bar ▶** move every bar start one beat earlier or later.
+
+The fix is applied to a copy of the saved analysis (`applyBeatFix`), stored in the same IndexedDB record and re-applied the next time the song is opened. Swing is detected again on the new beats.
+
 ## 7. From grid to chart
 
 Every grid point collects the strongest onset that snaps to it. Each grid point then gets a **score**: its strength divided by the strongest onset within ±8 beats, so quiet passages still get notes. That is multiplied by a metric weight: downbeat 1.3, beat 1.1, eighth/triplet 0.85, sixteenth 0.6.

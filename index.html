@@ -78,6 +78,12 @@ input[type=range]{width:100%;accent-color:var(--gold)}
 .crop-lab{display:block;font-size:13.5px;color:var(--muted);margin-bottom:2px}
 #bgSel{grid-template-columns:2fr 1fr 1fr}
 .diffs button:disabled{opacity:.35;cursor:default}
+.fix{display:flex;flex-direction:column;gap:8px}
+.fix output{font-family:var(--mono);font-size:14px;font-variant-numeric:tabular-nums}
+.fixbtns{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
+.fixbtns button{font:inherit;font-weight:700;font-size:14px;color:var(--fg);background:transparent;border:1.5px solid var(--line);border-radius:10px;padding:8px 2px;cursor:pointer;white-space:nowrap}
+.fixbtns button:disabled{opacity:.35;cursor:default}
+.fixbtns button:focus-visible{outline:3px solid var(--sky);outline-offset:2px}
 .actions{display:grid;grid-template-columns:2fr 1fr;gap:10px}
 .btn{font-family:var(--display);font-size:20px;border-radius:14px;padding:14px 16px;border:0;cursor:pointer;color:#1a1530;background:var(--gold)}
 .btn.ghost{background:transparent;color:var(--fg);border:1.5px solid var(--line);font-family:var(--body);font-weight:700;font-size:15px}
@@ -169,6 +175,17 @@ input[type=range]{width:100%;accent-color:var(--gold)}
         <span><i class="bar sq" style="background:var(--red)"></i>Spin</span>
         <span><i class="sq" style="background:var(--mint);width:3px"></i>Triplet grid</span>
       </div>
+    </div>
+    <div class="fix">
+      <div class="crop-head"><span class="label" id="fixLab">Beat fix</span><output id="fixOut">As detected</output></div>
+      <div class="fixbtns" role="group" aria-labelledby="fixLab">
+        <button data-fix="half" aria-label="Half tempo">÷2</button>
+        <button data-fix="double" aria-label="Double tempo">×2</button>
+        <button data-fix="left" aria-label="Move bar start one beat earlier">◀ Bar</button>
+        <button data-fix="right" aria-label="Move bar start one beat later">Bar ▶</button>
+        <button data-fix="reset">Reset</button>
+      </div>
+      <p class="note">If the beat lines in the close-up run twice too fast or too slow, or the bar numbers sit on the wrong beat, fix them here. Saved with the song.</p>
     </div>
     <div class="crop">
       <div class="crop-head"><span class="label">Play</span><output id="cropOut">–</output></div>
@@ -466,24 +483,8 @@ function analyzeAudio(x, sr, report) {
   const blen = i => i < nb - 1 ? beats[i + 1] - beats[i] : (i > 0 ? beats[i] - beats[i - 1] : P * hopT);
   if (report) report(0.93);
 
-  // 5. Swing / triplet feel: per beat, do the off-beat onsets sit on quarters or on thirds?
-  const sub = new Uint8Array(nb).fill(4);
-  { const v = new Float32Array(nb), wt = new Float32Array(nb); let oi = 0;
-    for (let i = 0; i < nb - 1; i++) {
-      const b0 = beats[i], L = blen(i);
-      while (oi < onsets.length && onsets[oi].t < b0 + 0.08 * L) oi++;
-      for (let j = oi; j < onsets.length && onsets[j].t < b0 + 0.92 * L; j++) {
-        const u = (onsets[j].t - b0) / L, s = onsets[j].s;
-        const d4 = Math.min(Math.abs(u - 0.25), Math.abs(u - 0.5), Math.abs(u - 0.75)), d3 = Math.min(Math.abs(u - 1 / 3), Math.abs(u - 2 / 3));
-        v[i] += s * (d4 - d3); wt[i] += s;
-      }
-    }
-    for (let i = 0; i < nb; i++) {
-      let V = 0, W = 0;
-      for (let j = Math.max(0, i - 3); j <= Math.min(nb - 1, i + 3); j++) { V += v[j]; W += wt[j]; }
-      if (W > 0.3 && V / W > 0.025) sub[i] = 3;
-    }
-  }
+  // 5. Swing / triplet feel (see swingGrid)
+  const sub = swingGrid(beats, onsets);
 
   // 6. Meter per section: which bar length (3, 4, 5 or 7 beats) makes the beat patterns repeat,
   //    smoothed with a Viterbi pass so the meter only changes with strong evidence
@@ -548,6 +549,73 @@ function analyzeAudio(x, sr, report) {
   const beatDur = ints.length ? ints[ints.length >> 1] : P * hopT;
   if (report) report(1);
   return { hopT, off, env, rms, onsets, beats, beatDur, bpm: 60 / beatDur, duration: dur, sub, barPos, barIdx, meters };
+}
+
+// Swing / triplet feel: per beat, do the off-beat onsets sit on quarters or on thirds?
+// Returns 4 (straight sixteenths) or 3 (triplets) for every beat. Runs in the Worker too.
+function swingGrid(beats, onsets) {
+  const nb = beats.length, sub = new Uint8Array(nb).fill(4), v = new Float32Array(nb), wt = new Float32Array(nb);
+  let oi = 0;
+  for (let i = 0; i < nb - 1; i++) {
+    const b0 = beats[i], L = beats[i + 1] - beats[i];
+    while (oi < onsets.length && onsets[oi].t < b0 + 0.08 * L) oi++;
+    for (let j = oi; j < onsets.length && onsets[j].t < b0 + 0.92 * L; j++) {
+      const u = (onsets[j].t - b0) / L, s = onsets[j].s;
+      const d4 = Math.min(Math.abs(u - 0.25), Math.abs(u - 0.5), Math.abs(u - 0.75)), d3 = Math.min(Math.abs(u - 1 / 3), Math.abs(u - 2 / 3));
+      v[i] += s * (d4 - d3); wt[i] += s;
+    }
+  }
+  for (let i = 0; i < nb; i++) {
+    let V = 0, W = 0;
+    for (let j = Math.max(0, i - 3); j <= Math.min(nb - 1, i + 3); j++) { V += v[j]; W += wt[j]; }
+    if (W > 0.3 && V / W > 0.025) sub[i] = 3;
+  }
+  return sub;
+}
+
+/* ---------- Manual beat fixes ---------- */
+// The player can correct the analysis: fix.tempo = 1 doubles the beats (adds one between each pair),
+// -1 halves them (keeps every other beat, on the side with more kicks); fix.shift moves every bar
+// start that many beats later. Works on a copy; the saved analysis is never changed.
+function applyBeatFix(a, fix) {
+  const out = Object.assign({}, a), tempo = fix ? clamp(fix.tempo | 0, -1, 1) : 0, shift = fix ? fix.shift | 0 : 0;
+  if (!tempo && !shift) return out;
+  const ons = a.onsets;
+  const kickAt = t => { // strongest low-band onset within 50 ms
+    let lo = 0, hi = ons.length; while (lo < hi) { const m = (lo + hi) >> 1; if (ons[m].t < t - 0.05) lo = m + 1; else hi = m; }
+    let k = 0; for (let j = lo; j < ons.length && ons[j].t <= t + 0.05; j++) k = Math.max(k, (ons[j].lo || 0) + 0.3 * ons[j].s);
+    return k;
+  };
+  let beats = Array.from(a.beats), barPos = Array.from(a.barPos), meters = a.meters.map(m => ({ ...m }));
+  if (tempo) {
+    // one meter for the whole song (the most common one), bar start where the kicks are strongest
+    const cnt = {}; meters.forEach((m, k) => { const e = k + 1 < meters.length ? meters[k + 1].beat : beats.length; cnt[m.m] = (cnt[m.m] || 0) + e - m.beat; });
+    const M = +Object.keys(cnt).sort((x, y) => cnt[y] - cnt[x])[0] || 4;
+    if (tempo > 0) { const nb = []; for (let i = 0; i < beats.length; i++) { nb.push(beats[i]); if (i + 1 < beats.length) nb.push((beats[i] + beats[i + 1]) / 2); } beats = nb; }
+    else {
+      let best = 0, bv = -1;
+      for (let p = 0; p < 2; p++) { let v = 0; for (let i = p; i < beats.length; i += 2) v += kickAt(beats[i]) + (a.barPos[i] === 0 ? 0.5 : 0); if (v > bv) { bv = v; best = p; } }
+      beats = beats.filter((b, i) => i % 2 === best);
+    }
+    const acc = beats.map(kickAt);
+    let bp = 0, bv = -1;
+    for (let p = 0; p < M; p++) { let v = 0, c = 0; for (let i = p; i < beats.length; i += M) { v += acc[i]; c++; } if (c && v / c > bv) { bv = v / c; bp = p; } }
+    barPos = beats.map((b, i) => ((i - bp) % M + M) % M);
+    meters = [{ beat: 0, m: M }];
+    out.sub = swingGrid(beats, ons);
+  }
+  if (shift) {
+    for (let k = 0; k < meters.length; k++) {
+      const m = meters[k].m, e = k + 1 < meters.length ? meters[k + 1].beat : beats.length;
+      for (let i = meters[k].beat; i < e; i++) barPos[i] = ((barPos[i] - shift) % m + m) % m;
+    }
+  }
+  const barIdx = new Int32Array(beats.length); let bar = -1;
+  for (let i = 0; i < beats.length; i++) { if (barPos[i] === 0) bar++; barIdx[i] = Math.max(0, bar); }
+  const ints = []; for (let i = 1; i < beats.length; i++) ints.push(beats[i] - beats[i - 1]); ints.sort((x, y) => x - y);
+  out.beats = beats; out.barPos = Int8Array.from(barPos); out.barIdx = barIdx; out.meters = meters;
+  out.beatDur = ints.length ? ints[ints.length >> 1] : a.beatDur; out.bpm = 60 / out.beatDur;
+  return out;
 }
 
 /* ---------- Chart generation ---------- */
@@ -1010,7 +1078,7 @@ function toWav(buf) {
 }
 
 /* ---------- Loading & analysis ---------- */
-const workerSrc = analyzeAudio.toString() + '\nself.onmessage=function(e){var r=analyzeAudio(e.data.pcm,e.data.sr,function(p){self.postMessage({type:"progress",p:p});});self.postMessage({type:"done",res:r});};';
+const workerSrc = analyzeAudio.toString() + '\n' + swingGrid.toString() + '\nself.onmessage=function(e){var r=analyzeAudio(e.data.pcm,e.data.sr,function(p){self.postMessage({type:"progress",p:p});});self.postMessage({type:"done",res:r});};';
 // Analysis runs on a mono 11.025 kHz copy (as accurate as 22 kHz for beats and onsets, a
 // quarter of the memory of the playback audio). It is handed to the worker (transferred, not
 // copied); if the worker fails it is rebuilt and analysed on the page instead.
@@ -1131,6 +1199,9 @@ const cache = {
     if (ok) this.trim();
     return ok;
   },
+  async setFix(fp, fix) {
+    return this.tx('readwrite', st => { const r = st.get(fp); r.onsuccess = () => { if (r.result) { r.result.fix = fix; st.put(r.result); } }; });
+  },
   async list() { return (await this.tx('readonly', (st, set) => { const r = st.getAll(); r.onsuccess = () => set(r.result || []); })) || []; },
   async trim() {
     const all = await this.list(); if (all.length <= CACHE_MAX) return;
@@ -1197,7 +1268,7 @@ function setStatus(text, p, err) {
   $('#statusBar').style.width = Math.round((p || 0) * 100) + '%';
   $('#statusBar').parentElement.hidden = !!err;
 }
-async function loadBuffer(name, buffer, isDemo, media, cached, fp) {
+async function loadBuffer(name, buffer, isDemo, media, cached, fp, fix) {
   stopPreview();
   $('#play').disabled = $('#listen').disabled = true;
   let res = cached;
@@ -1206,22 +1277,47 @@ async function loadBuffer(name, buffer, isDemo, media, cached, fp) {
     res = await runAnalysis(buffer, p => { if (!isDemo) setStatus('Analysing rhythm…', 0.05 + 0.9 * p); });
     if (fp) cache.put(fp, name, { ...res }).then(showCacheInfo); // a plain copy: the page adds helper functions to res below
   }
-  current = prepareAnalysis(Object.assign(res, { name, seed: fp || name, buffer: media ? null : buffer, isDemo, fromCache: !!cached }, media || {}));
+  fix = fix || { tempo: 0, shift: 0 };
+  current = prepareAnalysis(Object.assign(applyBeatFix(res, fix), { base: res, fix, fp, name, seed: fp || name, buffer: media ? null : buffer, isDemo, fromCache: !!cached }, media || {}));
   buffer = null;
   detailStart = 0; cropStart = 0;
   if (!isDemo) setStatus('');
   $('#trackName').textContent = name;
   $('#trackTag').textContent = isDemo ? 'Demo' : cached ? 'Saved analysis' : 'Your song';
   $('#trackTag').classList.toggle('demo', isDemo);
+  showStats();
+  $('#play').disabled = $('#listen').disabled = false;
+  refreshMap();
+}
+function showStats() {
   const lo = Math.round(current.bpmLo), hi = Math.round(current.bpmHi);
   $('#stBpm').innerHTML = (hi / lo > 1.06 ? lo + '–' + hi : Math.round(current.bpm)) + ' <small>bpm</small>';
   const d = Math.round(current.duration);
   $('#stLen').textContent = Math.floor(d / 60) + ':' + String(d % 60).padStart(2, '0');
   $('#stOn').textContent = current.onsets.length;
   $('#stMeter').innerHTML = current.meterList.slice(0, 3).map(m => m + '/4').join(' ') + (current.swingShare > 0.35 ? ' <small>swing</small>' : '');
-  $('#play').disabled = $('#listen').disabled = false;
-  refreshMap();
+  const f = current.fix, parts = [];
+  if (f.tempo) parts.push(f.tempo > 0 ? 'Tempo ×2' : 'Tempo ÷2');
+  if (f.shift) parts.push('bar start ' + (f.shift > 0 ? '+' : '−') + Math.abs(f.shift) + ' beat' + (Math.abs(f.shift) > 1 ? 's' : ''));
+  $('#fixOut').textContent = parts.length ? parts.join(' · ') : 'As detected';
+  const b = k => $(`.fixbtns [data-fix=${k}]`);
+  b('half').disabled = f.tempo < 0; b('double').disabled = f.tempo > 0; b('reset').disabled = !f.tempo && !f.shift;
 }
+// Re-apply a beat fix to the saved analysis, in place, so the playing element and its audio graph stay
+$('.fixbtns').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-fix]'); if (!btn || btn.disabled || !current) return;
+  const f = { ...current.fix }, k = btn.dataset.fix;
+  if (k === 'half') { f.tempo = Math.max(-1, f.tempo - 1); f.shift = 0; }
+  else if (k === 'double') { f.tempo = Math.min(1, f.tempo + 1); f.shift = 0; }
+  else if (k === 'left') f.shift--;
+  else if (k === 'right') f.shift++;
+  else { f.tempo = 0; f.shift = 0; }
+  const wasPreview = !!preview; stopPreview(true);
+  Object.assign(current, applyBeatFix(current.base, f), { fix: f });
+  delete current.wave; prepareAnalysis(current);
+  if (current.fp) cache.setFix(current.fp, f);
+  showStats(); refreshMap(); if (wasPreview) startPreview();
+});
 function refreshMap() {
   if (!current) return;
   const [cs, ce] = cropRange();
@@ -1246,7 +1342,7 @@ async function handleFile(f) {
     const stream = () => { const url = URL.createObjectURL(f), el = new Audio(); el.preload = 'auto'; el.src = url; return { media: el, mediaUrl: url }; };
     let fp = null, rec = null;
     try { fp = await fingerprint(f); rec = await cache.get(fp); } catch (e) {}
-    if (rec) { await loadBuffer(name, null, false, stream(), rec.res, fp); return; }
+    if (rec) { await loadBuffer(name, null, false, stream(), rec.res, fp, rec.fix); return; }
     // a small mono 11 kHz decode is all the analysis needs, and much quicker than a full-quality one
     const t0 = performance.now(), tick = () => setStatus(`Reading ${f.name}… ${Math.round((performance.now() - t0) / 1000)} s`, 0.03);
     tick(); const timer = setInterval(tick, 1000);

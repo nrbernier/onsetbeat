@@ -52,3 +52,18 @@ test('meter change 4/4 → 5/4 → 4/4 is found within two bars', () => {
   const b5 = r.an.meters[1].beat, b4 = r.an.meters[2].beat;
   assert.ok(Math.abs(b5 - 48) <= 8 && Math.abs(b4 - 98) <= 8, `changes at beats ${b5} and ${b4}`);
 });
+
+test('beat fixes: ×2, ÷2 and moving the bar start', () => {
+  const r = analyse('4/4 at 120 bpm', [{ bpm: 120, beats: 96, meter: 4 }]), a = r.an;
+  const fixed = fix => C.prepareAnalysis(Object.assign(C.applyBeatFix(a, fix), { name: 'fix' }));
+  const dbl = fixed({ tempo: 1 }), half = fixed({ tempo: -1 });
+  assert.ok(Math.abs(dbl.bpm - 240) < 6, `×2 gives ${dbl.bpm.toFixed(1)}`);
+  assert.ok(Math.abs(half.bpm - 60) < 2, `÷2 gives ${half.bpm.toFixed(1)}`);
+  assert.ok(beatAcc({ an: dbl, truth: r.truth }) >= 0.95, '×2 keeps every true beat');
+  assert.ok(downAcc({ an: half, truth: r.truth }) >= 0.85, `÷2 keeps bar starts on downbeats: ${downAcc({ an: half, truth: r.truth }).toFixed(2)}`);
+  assert.ok(downAcc({ an: fixed({ shift: 1 }), truth: r.truth }) < 0.2, 'shift moves bar starts off the downbeat');
+  assert.deepEqual(Array.from(fixed({ shift: 4 }).barPos), Array.from(a.barPos), 'a full bar of shift changes nothing');
+  assert.equal(C.applyBeatFix(a, { tempo: 0, shift: 0 }).beats, a.beats, 'no fix: same beats');
+  assert.equal(a.beats.length, r.an.beats.length, 'the analysis itself is not changed');
+  for (const k of Object.keys(C.DIFFS)) assert.ok(C.generateMap(dbl, k, 0.6).objs.length > 10, `chart after ×2 on ${k}`);
+});
