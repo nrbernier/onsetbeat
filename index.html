@@ -618,7 +618,7 @@ function sustainInfo(an, ta, tb) {
 function generateMap(an, key, aspect) {
   const D = DIFFS[key], G = an.grid, n = G.length;
   const LMIN = D.r * 2.4, LMAX = Math.min(aspect >= 1 ? aspect : 1, aspect >= 1 ? 1 : 1 / aspect) * 0.6; // track length limits, as in layoutMap
-  const rng = mulberry32(hashStr(an.name + '|' + key + '|' + an.duration.toFixed(2)));
+  const rng = mulberry32(hashStr((an.seed || an.name) + '|' + key + '|' + an.duration.toFixed(2))); // seed: file fingerprint, so a renamed copy gets the same chart
   // strength relative to the loudest onset within ±8 beats, so quiet sections still get notes
   const lm = new Float32Array(n);
   { let j0 = 0, j1 = 0; for (let i = 0; i < n; i++) { while (G[j0].beat < G[i].beat - 8) j0++; while (j1 < n - 1 && G[j1 + 1].beat <= G[i].beat + 8) j1++; let m = 0; for (let j = j0; j <= j1; j++) if (G[j].s > m) m = G[j].s; lm[i] = m; } }
@@ -1134,7 +1134,7 @@ async function loadBuffer(name, buffer, isDemo, media, cached, fp) {
     res = await runAnalysis(buffer, p => { if (!isDemo) setStatus('Analysing rhythm…', 0.05 + 0.9 * p); });
     if (fp) cache.put(fp, name, { ...res }).then(showCacheInfo); // a plain copy: the page adds helper functions to res below
   }
-  current = prepareAnalysis(Object.assign(res, { name, buffer: media ? null : buffer, isDemo, fromCache: !!cached }, media || {}));
+  current = prepareAnalysis(Object.assign(res, { name, seed: fp || name, buffer: media ? null : buffer, isDemo, fromCache: !!cached }, media || {}));
   buffer = null;
   detailStart = 0; cropStart = 0;
   if (!isDemo) setStatus('');
@@ -1415,6 +1415,12 @@ function songNow(perf) {
 }
 
 let wakeLock = null;
+// the browser drops the lock whenever the page is hidden, so it is asked for again on return
+async function keepAwake() {
+  if (wakeLock && !wakeLock.released) return;
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { wakeLock = null; }
+}
+function releaseWake() { try { wakeLock && wakeLock.release(); } catch (e) {} wakeLock = null; }
 async function startGame() {
   if (!current) return;
   stopPreview(true);
@@ -1429,7 +1435,7 @@ async function startGame() {
   const D = G.map.D;
   Object.assign(G, { running: true, paused: false, ended: false, objs: G.map.objs, D, score: 0, combo: 0, maxCombo: 0,
     counts: { 300: 0, 100: 0, 50: 0, 0: 0 }, health: 1, pops: [], errs: [], first: 0, spin: null, lastPerf: performance.now(), beatI: 0, failed: false });
-  for (const o of G.objs) { o.done = false; o.res = null; o.headDone = false; o.headHit = false; o.tickI = 0; o.tickHit = 0; o.following = false; o.acc = 0; o.vis = 0; o.doneAt = 0; o.shake = 0; }
+  for (const o of G.objs) { o.done = false; o.res = null; o.headDone = false; o.headHit = false; o.tickI = 0; o.tickHit = 0; o.following = false; o.acc = 0; o.net = 0; o.vis = 0; o.bonus = 0; o.doneAt = 0; o.shake = 0; }
   G.lastEnd = G.objs.length ? Math.max(...G.objs.map(o => o.end || o.t)) : ce;
   const firstT = G.objs.length ? G.objs[0].t : cs;
   const lead = Math.max(1.0, D.ar + 0.8 - (firstT - cs));
@@ -1440,7 +1446,7 @@ async function startGame() {
     current.media.onended = () => { if (G.running && !G.ended) finish(false); };
     G.media = current.media; G.mdelay = lead; G.gain = g.gain; G.analyser = g.analyser; G.src = null;
     G.freq = new Uint8Array(G.analyser.frequencyBinCount);
-    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { wakeLock = null; }
+    keepAwake();
     if (!G.loop) G.loop = requestAnimationFrame(frame);
     return;
   }
@@ -1459,7 +1465,7 @@ async function startGame() {
     gg.setValueAtTime(1, fs); gg.linearRampToValueAtTime(0.0001, G.startAt + ce);
     G.src.start(at, cs, ce - cs + 0.05);
   } else G.src.start(at, cs);
-  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { wakeLock = null; }
+  keepAwake();
   if (!G.loop) G.loop = requestAnimationFrame(frame);
 }
 function stopAudio() {
@@ -1469,7 +1475,8 @@ function stopAudio() {
 function quitGame() {
   G.running = false; stopAudio(); if (actx && actx.state === 'suspended') actx.resume().catch(() => {});
   $('#game').hidden = true; document.body.style.overflow = '';
-  try { wakeLock && wakeLock.release(); } catch (e) {} wakeLock = null;
+  releaseWake();
+  if (G.loop) { cancelAnimationFrame(G.loop); G.loop = 0; } // no drawing while the song page is shown
   drawAnalysis();
 }
 function pauseGame() {
@@ -1487,7 +1494,10 @@ $('#restartBtn').addEventListener('click', () => { stopAudio(); actx.resume().ca
 $('#quitBtn').addEventListener('click', quitGame);
 $('#retryBtn').addEventListener('click', startGame);
 $('#backBtn').addEventListener('click', quitGame);
-document.addEventListener('visibilitychange', () => { if (document.hidden) { pauseGame(); stopPreview(); } });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { pauseGame(); stopPreview(); }
+  else if (G.running && !G.ended && !$('#game').hidden) keepAwake();
+});
 
 /* judgement */
 function addPop(x, y, res) { G.pops.push({ x, y, res, at: performance.now() }); }
@@ -1532,7 +1542,8 @@ stage.addEventListener('pointermove', e => {
     const a = Math.atan2(p.y - PF.cy, p.x - PF.cx);
     if (q.ang !== null && Math.hypot(p.x - PF.cx, p.y - PF.cy) > 12) {
       let d = a - q.ang; while (d > Math.PI) d -= TAU; while (d < -Math.PI) d += TAU;
-      if (Math.abs(d) < 1.3) { sp.acc += Math.abs(d); sp.vis += d; }
+      // net rotation: wiggling back and forth cancels out; reversing keeps the best turn so far
+      if (Math.abs(d) < 1.3) { sp.net += d; sp.acc = Math.max(sp.acc, Math.abs(sp.net)); sp.vis += d; }
     }
     q.ang = a;
   }
@@ -1606,7 +1617,7 @@ function finish(failed) {
     }
   }
   setTimeout(() => { if (G.ended && !$('#game').hidden) $('#results').hidden = false; }, failed ? 400 : 900);
-  try { wakeLock && wakeLock.release(); } catch (e) {} wakeLock = null;
+  releaseWake();
 }
 
 /* drawing */

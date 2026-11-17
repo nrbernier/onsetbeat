@@ -105,7 +105,7 @@ Each picked note then becomes a marker, depending on what happens until the next
 
 ![Chart generation for four difficulties](img/6-chart-difficulties.svg)
 
-The randomness is seeded from the song name and length, so the same song always gives the same chart.
+The randomness is seeded from a fingerprint of the file (its size and a hash of its first and last 256 KB) and its length, so the same song always gives the same chart, even if the file is renamed.
 
 ## 8. Placing markers on the screen
 
