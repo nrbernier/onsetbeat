@@ -588,7 +588,7 @@ function prepareAnalysis(an) {
     let lo = 0, hi = G.length - 1;
     while (hi - lo > 1) { const m = (lo + hi) >> 1; if (G[m].t < o.t) lo = m; else hi = m; }
     const g = Math.abs(G[lo].t - o.t) <= Math.abs(G[hi].t - o.t) ? G[lo] : G[hi];
-    g.s = Math.max(g.s, o.s);
+    if (o.s > g.s) { g.s = o.s; g.lo = o.lo || 0; g.hi = o.hi || 0; } // band strengths of the strongest onset there
   }
   an.grid = G;
   // tempo summary: smoothed per-beat BPM, reported as a range when it moves
@@ -614,6 +614,14 @@ function sustainInfo(an, ta, tb) {
   for (let f = i0; f <= i1; f++) { sr += an.rms[f]; se += an.env[f]; }
   const k = i1 - i0 + 1, inner = sr / k, flux = se / k;
   return { sustained: inner / peak >= 0.5 && flux < 0.75 * an.envMean, loud: inner > 0.3 * an.rmsP90 };
+}
+
+// What kind of sound starts a marker: 'k' kick/bass (mostly low band), 's' snare or other strong hit,
+// 'h' hat or other light hit (weak for its surroundings). Drives the shape of the layout.
+function soundClass(g, localMax) {
+  const lo = g.lo || 0, hi = g.hi || 0;
+  if (lo > 0.3 && lo / (lo + hi + 1e-9) > 0.65) return 'k';
+  return g.s < 0.45 * localMax ? 'h' : 's';
 }
 
 function generateMap(an, key, aspect) {
@@ -669,7 +677,7 @@ function generateMap(an, key, aspect) {
   const objs = []; let lastSpinEnd = -1e9;
   for (let k = 0; k < picks.length; k++) {
     const ia = picks[k], ib = picks[k + 1], ga = G[ia];
-    const o = { type: 'tap', t: ga.t, beat: ga.beat };
+    const o = { type: 'tap', t: ga.t, beat: ga.beat, lvl: ga.level, cls: soundClass(ga, lm[ia]) };
     objs.push(o);
     if (ib === undefined) break;
     const gb = G[ib], gap = gb.beat - ga.beat, sus = sustainInfo(an, ga.t, gb.t);
@@ -713,23 +721,94 @@ function bezierPts(ax, ay, cx, cy, ex, ey, NP) {
   return { pts, cum };
 }
 
+const TURN_LVL = [0.85, 0.35, -0.55, -0.3];    // turn at a downbeat, beat, eighth/triplet, sixteenth (radians)
+const TURN_CLS = { k: 0.45, s: -0.4, h: 0.1 };  // extra turn for a kick, snare or hat
 function layoutMap(objs, an, D, aspect, rng) {
-  const fw = aspect >= 1 ? aspect : 1, fh = aspect >= 1 ? 1 : 1 / aspect;
+  const fw = aspect >= 1 ? aspect : 1, fh = aspect >= 1 ? 1 : 1 / aspect, NP = 40;
   const r = D.r, m = r * 1.15, sep = r * 2.2, sep2 = sep * sep, maxD = Math.min(fw, fh) * 0.62;
   const inB = (x, y) => x >= m && x <= fw - m && y >= m && y <= fh - m;
   // everything still on screen when a new marker appears: circles and sampled slider bodies
   let shown = [];
   const minD2 = (pts) => { let best = Infinity; for (const S of shown) for (const a of pts) for (const b of S.pts) { const d = (a.x - b.x) ** 2 + (a.y - b.y) ** 2; if (d < best) best = d; } return best; };
+  const sample = pts => pts.filter((p, i) => i % 3 === 0 || i === NP);
+  // The path turns by rules, not by chance: by where each note sits in the bar and what sound starts it
+  // (kick, snare, hat), so a repeated rhythm draws the same shape again. Every two bars it is mirrored.
+  const barOf = o => an.barIdx[clamp(Math.floor(o.beat + 1e-6), 0, an.barIdx.length - 1)];
+  const mirOf = o => (barOf(o) >> 1) % 2 ? -1 : 1;
+  const turnOf = o => mirOf(o) * ((TURN_LVL[o.lvl ?? 1] ?? 0) + (TURN_CLS[o.cls] ?? 0));
+  const stepOf = (o, from) => clamp(D.spacing * Math.max(0.25, (o.t - from) / an.beatLenAt(o.t)) * (o.cls === 'h' ? 0.85 : o.cls === 'k' && o.lvl === 0 ? 1.15 : 1), sep, maxD);
+  const lenOf = o => clamp(D.vel * (o.end - o.t) / o.trav, r * 2.4, Math.min(fw, fh) * 0.6);
   let px = fw / 2, py = fh / 2, ang = rng() * TAU, prevEnd = null;
-  for (const o of objs) {
-    if (o.type === 'spinner') { o.x = fw / 2; o.y = fh / 2; px = o.x; py = o.y; prevEnd = o.end; shown = []; continue; }
+
+  // a placed marker becomes the new path end and joins what is on screen
+  function commit(o) {
+    if (o.type === 'slider') {
+      const P = o.pts; o.len = o.cum[NP] || 1e-6; o.span = (o.end - o.t) / o.trav;
+      // ticks on each beat inside the phrase, at every turn, and at the end
+      const ticks = [];
+      for (const b of an.beats) if (b > o.t + 0.06 && b < o.end - 0.06) ticks.push(b);
+      for (let k = 1; k < o.trav; k++) ticks.push(o.t + k * o.span);
+      ticks.push(Math.max(o.t + 0.02, o.end - 0.036));
+      ticks.sort((a, b) => a - b);
+      o.ticks = ticks.filter((t, i) => i === 0 || t - ticks[i - 1] > 0.06);
+      const odd = o.trav % 2, fin = odd ? P[NP] : P[0], pre = odd ? P[NP - 1] : P[1];
+      ang = Math.atan2(fin.y - pre.y, fin.x - pre.x); px = fin.x; py = fin.y; prevEnd = o.end;
+      shown.push({ pts: sample(P), until: o.end + 0.3 });
+    } else {
+      if (prevEnd !== null && Math.hypot(o.x - px, o.y - py) > 1e-6) ang = Math.atan2(o.y - py, o.x - px);
+      px = o.x; py = o.y; prevEnd = o.t;
+      shown.push({ pts: [{ x: o.x, y: o.y }], until: o.t + 0.3 });
+    }
+  }
+
+  // Whole-bar placement: build the bar's shape from its rhythm, then rotate, mirror and move it so
+  // it starts one step from the previous marker, stays on the field and clears everything on screen.
+  function placeGroup(gr) {
+    let x = 0, y = 0, h = 0, prevT = null;
+    const loc = [];
+    for (let i = 0; i < gr.length; i++) {
+      const o = gr[i];
+      if (i > 0) { h += turnOf(o); const d = stepOf(o, prevT); x += Math.cos(h) * d; y += Math.sin(h) * d; }
+      const e = { x, y };
+      if (o.type === 'slider') {
+        const L = lenOf(o), dir = h + mirOf(o) * 0.35, bend = mirOf(o) * 0.22 * L;
+        const ex = x + Math.cos(dir) * L, ey = y + Math.sin(dir) * L;
+        const g = bezierPts(x, y, (x + ex) / 2 - Math.sin(dir) * bend, (y + ey) / 2 + Math.cos(dir) * bend, ex, ey, NP);
+        e.pts = g.pts; e.cum = g.cum;
+        const odd = o.trav % 2, fin = odd ? g.pts[NP] : g.pts[0], pre = odd ? g.pts[NP - 1] : g.pts[1];
+        x = fin.x; y = fin.y; h = Math.atan2(fin.y - pre.y, fin.x - pre.x); prevT = o.end;
+      } else prevT = o.t;
+      loc.push(e);
+    }
+    const first = gr[0], d0 = prevEnd === null ? 0 : stepOf(first, prevEnd), h0 = ang + turnOf(first);
+    for (let a = 0; a < 24; a++) {
+      const th = h0 + (a % 2 ? -1 : 1) * Math.ceil(a / 2) * TAU / 24, c = Math.cos(th), s = Math.sin(th);
+      const sx = prevEnd === null ? fw / 2 : px + c * d0, sy = prevEnd === null ? fh / 2 : py + s * d0;
+      for (const mi of [1, -1]) {
+        const T = p => ({ x: sx + c * p.x - s * mi * p.y, y: sy + s * p.x + c * mi * p.y });
+        const placed = []; let ok = true;
+        for (let i = 0; i < gr.length && ok; i++) {
+          const o = gr[i], e = loc[i], pts = e.pts ? e.pts.map(T) : [T(e)], chk = e.pts ? sample(pts) : pts, t0 = o.t - D.ar;
+          for (const p of chk) if (!inB(p.x, p.y)) { ok = false; break; }
+          for (const S of shown) { if (!ok) break; if (S.until > t0) for (const p of chk) { for (const q of S.pts) if ((p.x - q.x) ** 2 + (p.y - q.y) ** 2 < sep2) { ok = false; break; } if (!ok) break; } }
+          for (const Q of placed) { if (!ok) break; if (Q.until > t0) for (const p of chk) { for (const q of Q.chk) if ((p.x - q.x) ** 2 + (p.y - q.y) ** 2 < sep2) { ok = false; break; } if (!ok) break; } }
+          placed.push({ pts, chk, until: (o.end || o.t) + 0.3 });
+        }
+        if (!ok) continue;
+        gr.forEach((o, i) => { o.x = placed[i].pts[0].x; o.y = placed[i].pts[0].y; if (o.type === 'slider') { o.pts = placed[i].pts; o.cum = loc[i].cum; } commit(o); });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Note-by-note placement, used when a whole bar cannot be fitted
+  function placeSeq(o) {
     shown = shown.filter(S => S.until > o.t - D.ar);
     if (prevEnd === null) { o.x = fw / 2 + (rng() - 0.5) * fw * 0.3; o.y = fh / 2 + (rng() - 0.5) * fh * 0.3; }
     else {
-      const gb = Math.max(0.25, (o.t - prevEnd) / an.beatLenAt(o.t));
-      const dist = clamp(D.spacing * gb, sep, maxD);
-      ang += (rng() - 0.5) * 1.4;
-      if (rng() < 0.18) ang += (rng() < 0.5 ? 1 : -1) * 2.0;
+      const dist = stepOf(o, prevEnd);
+      ang += turnOf(o);
       let best = null, bestD = -1, found = false;
       for (const dm of [1, 1.3, 1.7, 0.85]) {
         const d = clamp(dist * dm, sep, maxD * 1.15);
@@ -738,8 +817,8 @@ function layoutMap(objs, an, D, aspect, rng) {
           const nx = px + Math.cos(th) * d, ny = py + Math.sin(th) * d;
           if (!inB(nx, ny)) continue;
           const md = minD2([{ x: nx, y: ny }]);
-          if (md >= sep2) { o.x = nx; o.y = ny; ang = th; found = true; }
-          else if (md > bestD) { bestD = md; best = { x: nx, y: ny, th }; }
+          if (md >= sep2) { o.x = nx; o.y = ny; found = true; }
+          else if (md > bestD) { bestD = md; best = { x: nx, y: ny }; }
         }
         if (found) break;
       }
@@ -748,60 +827,52 @@ function layoutMap(objs, an, D, aspect, rng) {
         const nx = m + rng() * (fw - 2 * m), ny = m + rng() * (fh - 2 * m);
         if (Math.hypot(nx - px, ny - py) < sep) continue;
         const md = minD2([{ x: nx, y: ny }]);
-        if (md >= sep2) { o.x = nx; o.y = ny; ang = Math.atan2(ny - py, nx - px); found = true; }
-        else if (md > bestD) { bestD = md; best = { x: nx, y: ny, th: Math.atan2(ny - py, nx - px) }; }
+        if (md >= sep2) { o.x = nx; o.y = ny; found = true; }
+        else if (md > bestD) { bestD = md; best = { x: nx, y: ny }; }
       }
       if (!found) {
-        if (best) { o.x = best.x; o.y = best.y; ang = best.th; }
-        else { ang = Math.atan2(fh / 2 - py, fw / 2 - px); o.x = clamp(px + Math.cos(ang) * dist, m, fw - m); o.y = clamp(py + Math.sin(ang) * dist, m, fh - m); }
+        if (best) { o.x = best.x; o.y = best.y; }
+        else { const a = Math.atan2(fh / 2 - py, fw / 2 - px); o.x = clamp(px + Math.cos(a) * dist, m, fw - m); o.y = clamp(py + Math.sin(a) * dist, m, fh - m); }
       }
     }
-    px = o.x; py = o.y;
     if (o.type === 'slider') {
-      const L0 = clamp(D.vel * (o.end - o.t) / o.trav, r * 2.4, Math.min(fw, fh) * 0.6);
-      const bendF = (rng() - 0.5) * 0.9, dir0 = ang + (rng() - 0.5) * 1.6;
-      let pick = null, pickD = -1;
+      const sx = o.x, sy = o.y, hd = prevEnd === null ? ang : Math.atan2(sy - py, sx - px) || ang;
+      const L0 = lenOf(o), bendF = (rng() - 0.5) * 0.9, dir0 = hd + (rng() - 0.5) * 1.6;
+      let pick = null;
       for (const lm of [1, 0.88]) { // never shrink enough to change the ball's speed noticeably
         const L = Math.max(r * 2.4, L0 * lm);
-        for (let a = 0; a < 24; a++) {
+        for (let a = 0; a < 24 && !pick; a++) {
           const dir = dir0 + (a % 2 ? -1 : 1) * Math.ceil(a / 2) * TAU / 24;
-          const ex = px + Math.cos(dir) * L, ey = py + Math.sin(dir) * L;
+          const ex = sx + Math.cos(dir) * L, ey = sy + Math.sin(dir) * L;
           if (!inB(ex, ey)) continue;
           const bend = bendF * L;
-          const cx = clamp((px + ex) / 2 - Math.sin(dir) * bend, m, fw - m), cy = clamp((py + ey) / 2 + Math.cos(dir) * bend, m, fh - m);
-          const geo = bezierPts(px, py, cx, cy, ex, ey, 40);
-          const md = minD2(geo.pts.filter((p, i) => i % 3 === 0 || i === 40));
-          if (md >= sep2) { pick = { geo, dir }; pickD = Infinity; break; }
-          if (md > pickD) { pickD = md; pick = { geo, dir }; }
+          const cx = clamp((sx + ex) / 2 - Math.sin(dir) * bend, m, fw - m), cy = clamp((sy + ey) / 2 + Math.cos(dir) * bend, m, fh - m);
+          const geo = bezierPts(sx, sy, cx, cy, ex, ey, NP);
+          if (minD2(sample(geo.pts)) >= sep2) pick = geo;
         }
-        if (pickD === Infinity) break;
+        if (pick) break;
       }
-      if (pickD !== Infinity) {
-        // no clear path for the phrase body: keep it as a plain tap instead of overlapping
-        o.type = 'tap'; delete o.end; delete o.trav; delete o.spanBeats;
-        prevEnd = o.t; shown.push({ pts: [{ x: o.x, y: o.y }], until: o.t + 0.3 });
-        continue;
-      }
-      const { pts, cum } = pick.geo, NP = 40;
-      o.pts = pts; o.cum = cum; o.len = cum[NP] || 1e-6;
-      o.span = (o.end - o.t) / o.trav;
-      // ticks on each beat inside the phrase, at every turn, and at the end
-      const ticks = [];
-      for (const b of an.beats) if (b > o.t + 0.06 && b < o.end - 0.06) ticks.push(b);
-      for (let k = 1; k < o.trav; k++) ticks.push(o.t + k * o.span);
-      ticks.push(Math.max(o.t + 0.02, o.end - 0.036));
-      ticks.sort((a, b) => a - b);
-      o.ticks = ticks.filter((t, i) => i === 0 || t - ticks[i - 1] > 0.06);
-      const fin = o.trav % 2 ? pts[NP] : pts[0];
-      px = fin.x; py = fin.y;
-      ang = o.trav % 2 ? Math.atan2(pts[NP].y - pts[NP - 1].y, pts[NP].x - pts[NP - 1].x) : Math.atan2(pts[0].y - pts[1].y, pts[0].x - pts[1].x);
-      prevEnd = o.end;
-      shown.push({ pts: pts.filter((p, i) => i % 3 === 0 || i === NP), until: o.end + 0.3 });
-    } else {
-      prevEnd = o.t;
-      shown.push({ pts: [{ x: o.x, y: o.y }], until: o.t + 0.3 });
+      if (pick) { o.pts = pick.pts; o.cum = pick.cum; }
+      // no clear path for the phrase body: keep it as a plain tap instead of overlapping
+      else { o.type = 'tap'; delete o.end; delete o.trav; delete o.spanBeats; }
     }
+    commit(o);
   }
+  // try the whole bar, then each half, then note by note
+  function place(gr) {
+    if (gr.length > 1 && placeGroup(gr)) return;
+    if (gr.length > 3) { const h = gr.length >> 1; place(gr.slice(0, h)); place(gr.slice(h)); return; }
+    for (const o of gr) placeSeq(o);
+  }
+
+  let group = [];
+  const flush = () => { if (group.length) { shown = shown.filter(S => S.until > group[0].t - D.ar); place(group); } group = []; };
+  for (const o of objs) {
+    if (o.type === 'spinner') { flush(); o.x = fw / 2; o.y = fh / 2; px = o.x; py = o.y; prevEnd = o.end; shown = []; continue; }
+    if (group.length && barOf(o) !== barOf(group[0])) flush();
+    group.push(o);
+  }
+  flush();
   assignCombos(objs, an, D);
   return { fw, fh };
 }

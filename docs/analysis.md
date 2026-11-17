@@ -109,15 +109,29 @@ The randomness is seeded from a fingerprint of the file (its size and a hash of 
 
 ## 8. Placing markers on the screen
 
-Positions follow the timing: the distance from one marker to the next grows with the time between them (0.30–0.40 screen units per beat, depending on difficulty). The direction drifts, with an occasional sharp turn.
+Positions follow the timing: the distance from one marker to the next grows with the time between them (0.30–0.40 screen units per beat, depending on difficulty).
+
+**Shapes follow the rhythm.** Each marker records what kind of sound starts it, from the band strengths of its onset: a **kick** (mostly low band), a **hat** (a light hit, under 45% of the strongest onset around it) or a **snare** (any other strong hit). The path then turns by fixed rules instead of at random:
+
+| Where the note sits | Turn |
+|---|---|
+| downbeat / beat | +0.85 / +0.35 rad |
+| eighth or triplet / sixteenth | −0.55 / −0.30 rad |
+| plus: kick / snare / hat | +0.45 / −0.40 / +0.10 rad |
+
+Hats sit a little closer (×0.85), a kick on the downbeat a little further (×1.15). Every two bars the turns are mirrored, so a section alternates between a shape and its mirror image.
+
+**Whole bars are placed at once.** A bar's markers (phrases included) are first laid out as one shape from these rules, then rotated in 24 steps and mirrored until the shape starts one step from the previous marker, stays on the field and clears everything on screen. A repeated rhythm therefore draws the same shape again, only turned. If the bar doesn't fit, each half is tried, and then single markers.
 
 **No overlap:** a new marker must keep **2.2 radii** between its centre and everything still visible when it appears. That means every earlier circle and every point along earlier phrase tracks.
 
-- The search tries 24 directions at four distances, then 160 random spots anywhere on the field.
-- A phrase tries 24 directions at three lengths.
+- Placing a single marker tries 24 directions at four distances, then 160 random spots anywhere on the field.
+- A single phrase tries 24 directions at two lengths.
 - If a phrase still can't fit, it is turned into a plain tap rather than overlap.
 
-Across 15,000 checked pairs of markers that share the screen, none overlap.
+**Follow lines** (Settings, on by default) draw dots from each marker to the next one in the same combo, like Ouendan.
+
+The test suite (`tests/chart.test.js`) checks this on every difficulty and screen shape: markers that share the screen never come closer than 2 radii.
 
 ![Layout snapshot](img/7-layout.svg)
 
