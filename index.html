@@ -226,6 +226,7 @@ input[type=range]{width:100%;accent-color:var(--gold)}
         <p class="note">Wave and stars: the song scrolls in from the right across a band at the top, with upcoming markers marked under it, and a dim starfield behind the markers.</p>
       </div>
       <div class="opt"><label for="optSounds">Hit sounds<span class="hint">A clap on every good hit</span></label><input type="checkbox" class="switch" id="optSounds"></div>
+      <div class="opt"><label for="optFollow">Follow lines<span class="hint">Dotted lines lead from each marker to the next one</span></label><input type="checkbox" class="switch" id="optFollow"></div>
       <div class="opt"><label for="optNofail">No fail<span class="hint">Keep playing when the life bar empties</span></label><input type="checkbox" class="switch" id="optNofail"></div>
       <div class="opt"><div><b>Saved analyses</b><span class="hint">Kept on this device so a song you've played before opens without re-analysing. <span id="cacheInfo">–</span></span></div><button class="btn ghost small" id="cacheClear">Clear</button></div>
       <div class="offset">
@@ -851,7 +852,7 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('onsetbeat:' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem('onsetbeat:' + k, JSON.stringify(v)); } catch (e) {} }
 };
-const settings = { bg: store.get('bg', 'wave'), cropLen: store.get('cropLen', 0), diff: store.get('diff', 'normal'), sounds: store.get('sounds', true), nofail: store.get('nofail', false), offset: store.get('offset', 0) };
+const settings = { bg: store.get('bg', 'wave'), cropLen: store.get('cropLen', 0), diff: store.get('diff', 'normal'), sounds: store.get('sounds', true), follow: store.get('follow', true), nofail: store.get('nofail', false), offset: store.get('offset', 0) };
 if (!DIFFS[settings.diff]) settings.diff = 'normal';
 
 let actx = null, noiseBuf = null;
@@ -1312,11 +1313,12 @@ function syncDiffs() { document.querySelectorAll('#diffs button').forEach(b => b
 syncDiffs();
 
 /* settings */
-const optS = $('#optSounds'), optN = $('#optNofail'), optO = $('#optOffset');
-optS.checked = settings.sounds; optN.checked = settings.nofail; optO.value = settings.offset;
+const optS = $('#optSounds'), optN = $('#optNofail'), optO = $('#optOffset'), optF = $('#optFollow');
+optS.checked = settings.sounds; optF.checked = settings.follow; optN.checked = settings.nofail; optO.value = settings.offset;
 const showOff = () => { $('#offOut').textContent = (settings.offset > 0 ? '+' : '') + settings.offset + ' ms'; };
 showOff();
 optS.addEventListener('change', () => { settings.sounds = optS.checked; store.set('sounds', settings.sounds); });
+optF.addEventListener('change', () => { settings.follow = optF.checked; store.set('follow', settings.follow); });
 const syncBg = () => document.querySelectorAll('#bgSel button').forEach(b => b.setAttribute('aria-checked', String(b.dataset.bg === settings.bg)));
 syncBg();
 $('#bgSel').addEventListener('click', e => { const b = e.target.closest('button[data-bg]'); if (!b) return; settings.bg = b.dataset.bg; store.set('bg', settings.bg); syncBg(); });
@@ -1653,6 +1655,7 @@ function draw(now, perf) {
   drawBackdrop(c, now, perf);
   const objs = G.objs, start = Math.max(0, G.first - 12);
   let endI = start; while (endI < objs.length && objs[endI].t - D.ar <= now) endI++;
+  if (settings.follow) drawFollow(c, now, start, endI, r);
   for (let i = endI - 1; i >= start; i--) {
     const o = objs[i];
     if (o.type === 'tap') drawTap(c, o, now, perf, r);
@@ -1759,6 +1762,24 @@ function drawWaveBackdrop(c, now, perf) {
     else { c.fillStyle = COLORS[1]; c.fillRect(x0 - 1, yb - 3, 3, 7); }
   }
   c.globalAlpha = 1; c.fillStyle = '#fff'; c.fillRect(Math.round(nowX) - 1, Bd.y - 3, 2, Bd.h + 6);
+}
+// Follow lines: dots from the end of a marker to the next one in the same combo. They appear with
+// the next marker and are eaten from the start as time runs from the first marker to the second.
+function drawFollow(c, now, start, endI, r) {
+  const objs = G.objs;
+  c.save(); c.lineCap = 'round'; c.strokeStyle = '#fff'; c.lineWidth = Math.max(2.5, r * 0.13); c.setLineDash([0.01, Math.max(9, r * 0.42)]);
+  for (let i = Math.max(1, start); i < endI; i++) {
+    const o = objs[i], p = objs[i - 1];
+    if (o.type === 'spinner' || p.type === 'spinner' || o.col !== p.col || o.num !== p.num + 1 || now > o.t) continue;
+    const pEnd = p.end || p.t;
+    const A = toPx(p.type === 'slider' ? sliderPosAt(p, p.end) : p), B = toPx(o.type === 'slider' ? o.pts[0] : o);
+    const dx = B.x - A.x, dy = B.y - A.y, L = Math.hypot(dx, dy); if (L < r * 2.6) continue;
+    const k = clamp((now - pEnd) / Math.max(0.05, o.t - pEnd), 0, 1);
+    const s0 = Math.max(r * 1.2, k * L), s1 = L - r * 1.2; if (s1 <= s0) continue;
+    c.globalAlpha = 0.5 * fadeIn(o, now);
+    c.beginPath(); c.moveTo(A.x + dx / L * s0, A.y + dy / L * s0); c.lineTo(A.x + dx / L * s1, A.y + dy / L * s1); c.stroke();
+  }
+  c.restore();
 }
 function circleBody(c, x, y, r, col, num) {
   c.beginPath(); c.arc(x, y, r, 0, TAU); c.fillStyle = COLORS[col]; c.fill();
