@@ -1,11 +1,8 @@
 // Generates the SVG illustrations for docs/analysis.md from the real analysis code.
 // Run from the repo root:  node docs/tools/make-figures.js
 const fs = require('fs'), path = require('path');
-const html = fs.readFileSync(path.join(__dirname, '../../index.html'), 'utf8');
-let core = html.slice(html.indexOf('/*CORE-START*/'), html.indexOf('/*CORE-END*/'));
 // expose intermediate results of the analysis for the figures
-core = core.replace('  if (report) report(1);\n  return { hopT,', '  globalThis.__dbg = { emis, wPath, nW, NL, minL, hopT, winF, hopW, nov, mEm, MS, mOf, sub };\n  if (report) report(1);\n  return { hopT,');
-const C = new Function(core + '\nreturn { analyzeAudio, prepareAnalysis, generateMap, sliderPosAt, DIFFS };')();
+const C = require('../../tests/core').loadCore(core => core.replace('  if (report) report(1);\n  return { hopT,', '  globalThis.__dbg = { emis, wPath, nW, NL, minL, hopT, winF, hopW, nov, mEm, MS, mOf, sub };\n  if (report) report(1);\n  return { hopT,'));
 const OUT = path.join(__dirname, '../img/');
 fs.mkdirSync(OUT, { recursive: true });
 const sr = 11025;
@@ -15,34 +12,8 @@ const svg = (w, h, body) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 
 const txt = (x, y, s, o = {}) => `<text x="${x}" y="${y}" ${F} font-size="${o.size || 13}" fill="${o.fill || P.fg}" text-anchor="${o.anchor || 'start'}"${o.weight ? ` font-weight="${o.weight}"` : ''}>${s}</text>`;
 const f1 = v => (Math.round(v * 10) / 10).toString();
 
-// ---- synthetic test tracks (same generator as the test suite) ----
-let seed = 7; const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647 * 2 - 1; };
-function track(sections, extra) {
-  let T = 0.4; const truth = [], evs = [];
-  for (const s of sections) {
-    const b = 60 / s.bpm;
-    for (let i = 0; i < s.beats; i++) {
-      const t = T + i * b, pos = i % s.meter; truth.push({ t, down: pos === 0 });
-      if (s.pad) { if (pos === 0) evs.push([t, 'pad', b * s.meter]); continue; }
-      evs.push([t, pos === 0 ? 'kick' : (pos === Math.floor(s.meter / 2) || (s.meter === 3 && pos === 2) ? 'snare' : 'snareL')]);
-      if (s.meter === 5 && pos === 3) evs.push([t, 'kick']);
-      const off = s.swing ? b * 2 / 3 : b / 2; evs.push([t + off, 'hat']);
-      if (!s.swing) { evs.push([t + b / 4, 'hatS']); evs.push([t + 3 * b / 4, 'hatS']); }
-    }
-    T += s.beats * b;
-  }
-  const x = new Float32Array(Math.ceil((T + 1) * sr));
-  const add = (t, fn, len) => { const s0 = Math.floor(t * sr); for (let i = 0; i < len * sr && s0 + i < x.length; i++) x[s0 + i] += fn(i / sr); };
-  for (const [t, k, len] of evs) {
-    if (k === 'kick') add(t, u => Math.sin(2 * Math.PI * (50 + 100 * Math.exp(-u * 30)) * u) * Math.exp(-u * 12) * 0.9, 0.3);
-    if (k === 'snare') add(t, u => rnd() * 0.45 * Math.exp(-u * 25), 0.2);
-    if (k === 'snareL') add(t, u => rnd() * 0.2 * Math.exp(-u * 30) + 0.2 * Math.sin(2 * Math.PI * 90 * u) * Math.exp(-u * 20), 0.2);
-    if (k === 'hat') add(t, u => rnd() * 0.12 * Math.exp(-u * 60), 0.05);
-    if (k === 'hatS') add(t, u => rnd() * 0.05 * Math.exp(-u * 70), 0.04);
-    if (k === 'pad') add(t, u => 0.25 * (Math.sin(2 * Math.PI * 220 * u) + 0.5 * Math.sin(2 * Math.PI * 277 * u)) * Math.min(1, u * 8), len);
-  }
-  return { x, truth, T };
-}
+// ---- synthetic test tracks (shared with the test suite) ----
+const { track } = require('../../tests/synth');
 function analyse(name, secs) { const { x, truth } = track(secs); const an = C.analyzeAudio(x, sr); const dbg = globalThis.__dbg; an.name = name; C.prepareAnalysis(an); return { an, dbg, truth }; }
 
 // ===== Figure 1: pipeline =====
