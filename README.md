@@ -39,6 +39,6 @@ node --test tests/*.test.js
 
 The tests run the real analysis and chart code from `index.html` on synthetic drum tracks with a known tempo, meter and swing (`tests/synth.js`), and check the charts for density, phrase speed and overlap. They run on every push (GitHub Actions). `node docs/tools/make-figures.js` redraws the figures in the docs from the same code.
 
-## Licence
+## Fonts
 
-Code: [MIT](LICENSE). Fonts in `fonts/`: SIL Open Font License 1.1 (licence texts alongside).
+The fonts in `fonts/` are under the SIL Open Font License 1.1 (licence texts alongside).
